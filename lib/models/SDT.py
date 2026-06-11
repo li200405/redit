@@ -486,6 +486,149 @@ class FinalLayer(nn.Module):
         return x
 
 
+class TargetQualityRefiner(nn.Module):
+    """
+    Estimates target reliability and builds an online temporal consensus target.
+
+    This module operates inside the model during training. It does not remove
+    samples or rewrite the dataset.
+    """
+
+    def __init__(
+            self,
+            hidden_channels=16,
+            residual_temperature=0.12,
+            temporal_scale_days=45.0,
+            sar_temperature=0.5,
+            correction_limit=2.0,
+    ):
+        super().__init__()
+        self.residual_temperature = residual_temperature
+        self.temporal_scale_days = temporal_scale_days
+        self.sar_temperature = sar_temperature
+        self.correction_limit = correction_limit
+
+        self.reliability_net = nn.Sequential(
+            nn.Conv2d(5, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+        nn.init.zeros_(self.reliability_net[-1].weight)
+        nn.init.zeros_(self.reliability_net[-1].bias)
+
+    def _date_weights(self, target, dates):
+        B, T, _, H, W = target.shape
+        dtype = target.dtype
+        device = target.device
+
+        if dates is None:
+            date_distance = torch.arange(T, device=device, dtype=dtype)
+            date_distance = (date_distance[:, None] - date_distance[None, :]).abs()
+            date_distance = date_distance.unsqueeze(0).expand(B, -1, -1)
+        else:
+            date_distance = (dates[:, :, None] - dates[:, None, :]).abs().to(dtype)
+
+        time_weight = torch.exp(-date_distance / max(self.temporal_scale_days, 1e-6))
+        eye = torch.eye(T, device=device, dtype=dtype).unsqueeze(0)
+        return time_weight * (1.0 - eye)
+
+    def forward(self, target, cond=None, dates=None, known_cloud_mask=None):
+        B, T, C, H, W = target.shape
+        if known_cloud_mask is None:
+            known_cloud_mask = torch.zeros(
+                (B, T, 1, H, W), device=target.device, dtype=target.dtype
+            )
+
+        date_weight = self._date_weights(target, dates)
+        known_clear = 1.0 - known_cloud_mask.float().clamp(0, 1)
+
+        sar = None
+        if cond is not None and cond.shape[1] == T:
+            sar = cond.float()
+            sar = torch.nn.functional.avg_pool2d(
+                sar.reshape(B * T, sar.shape[2], H, W),
+                kernel_size=3,
+                stride=1,
+                padding=1,
+            ).reshape(B, T, sar.shape[2], H, W)
+
+        consensus_sum = torch.zeros_like(target)
+        denominator = torch.zeros((B, T, H, W), device=target.device, dtype=target.dtype)
+        available_weight = torch.zeros_like(denominator)
+
+        # Accumulate one reference frame at a time to avoid allocating a
+        # B x T x T x H x W tensor.
+        for reference_idx in range(T):
+            pair_weight = date_weight[:, :, reference_idx, None, None]
+            if sar is not None:
+                sar_distance = (
+                    sar - sar[:, reference_idx:reference_idx + 1]
+                ).abs().mean(dim=2)
+                pair_weight = pair_weight * torch.exp(
+                    -sar_distance.to(target.dtype) / max(self.sar_temperature, 1e-6)
+                )
+
+            clear_weight = (
+                pair_weight * known_clear[:, reference_idx, 0][:, None]
+            )
+            denominator = denominator + clear_weight
+            available_weight = available_weight + pair_weight
+            consensus_sum = consensus_sum + (
+                clear_weight[:, :, None] * target[:, reference_idx:reference_idx + 1]
+            )
+
+        consensus = consensus_sum / denominator[:, :, None].clamp_min(1e-6)
+
+        fallback = target.median(dim=1, keepdim=True).values.expand(-1, T, -1, -1, -1)
+        has_reference = denominator[:, :, None] > 1e-6
+        consensus = torch.where(has_reference, consensus, fallback)
+
+        support = (denominator / available_weight.clamp_min(1e-6)).clamp(0, 1)
+        support = support.unsqueeze(2)
+
+        residual = (target - consensus).abs()
+        residual_mean = residual.mean(dim=2, keepdim=True)
+        residual_max = residual.amax(dim=2, keepdim=True)
+        local_residual = torch.nn.functional.avg_pool2d(
+            residual_mean.reshape(B * T, 1, H, W),
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        ).reshape(B, T, 1, H, W)
+
+        known_cloud = known_cloud_mask.float().clamp(0, 1)
+        base_reliability = torch.exp(
+            -residual_mean / max(self.residual_temperature, 1e-6)
+        )
+        base_reliability = (
+            base_reliability * support + (1.0 - support)
+        ).clamp(1e-4, 1.0 - 1e-4)
+        calibration_base = (
+            base_reliability * (1.0 - known_cloud) + 1e-4 * known_cloud
+        ).clamp(1e-4, 1.0 - 1e-4)
+        pseudo_reliability = calibration_base
+
+        quality_features = torch.cat(
+            [residual_mean, residual_max, local_residual, support, known_cloud], dim=2
+        ).reshape(B * T, 5, H, W)
+        correction = self.reliability_net(quality_features).reshape(B, T, 1, H, W)
+        correction = self.correction_limit * torch.tanh(correction)
+
+        base_logit = torch.logit(calibration_base)
+        raw_reliability = torch.sigmoid(base_logit + correction)
+        reliability = raw_reliability * (1.0 - known_cloud)
+
+        return {
+            'reliability': reliability,
+            'raw_reliability': raw_reliability,
+            'pseudo_reliability': pseudo_reliability.detach(),
+            'consensus': consensus,
+            'support': support,
+        }
+
+
 class SDT(nn.Module):
     """
     Sequential Denoising Transformer.
@@ -507,7 +650,12 @@ class SDT(nn.Module):
             cond_in_channels=3,
             cross_attention=True,
             cloud_aware_attention=True,
-            use_cloud_mask_embedding=True
+            use_cloud_mask_embedding=True,
+            target_quality_refinement=True,
+            target_quality_hidden=16,
+            target_quality_residual_temperature=0.12,
+            target_quality_temporal_scale_days=45.0,
+            target_quality_sar_temperature=0.5,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -518,6 +666,7 @@ class SDT(nn.Module):
         self.cond_in_channels = cond_in_channels
         self.cloud_aware_attention = cloud_aware_attention
         self.use_cloud_mask_embedding = use_cloud_mask_embedding
+        self.target_quality_refinement = target_quality_refinement
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.cond_embedder = PatchEmbed(input_size, patch_size, cond_in_channels, hidden_size, bias=True)
@@ -525,6 +674,12 @@ class SDT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.date_embedder = DateEmbedder(hidden_size, T=10000)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        self.target_quality_refiner = TargetQualityRefiner(
+            hidden_channels=target_quality_hidden,
+            residual_temperature=target_quality_residual_temperature,
+            temporal_scale_days=target_quality_temporal_scale_days,
+            sar_temperature=target_quality_sar_temperature,
+        ) if target_quality_refinement else None
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -617,7 +772,18 @@ class SDT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, date=None, cond=None, cloud_mask=None, location=None, semantics=None):
+    def forward(
+            self,
+            x,
+            t,
+            date=None,
+            cond=None,
+            cloud_mask=None,
+            location=None,
+            semantics=None,
+            quality_target=None,
+            quality_only=False,
+    ):
         """
         Forward pass of SDT.
         x: (B, T, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -625,6 +791,15 @@ class SDT(nn.Module):
         date: (B, T) tensor of dates
         cond: same with x, conditional inputs such as SAR images
         """
+
+        if quality_target is not None and self.target_quality_refiner is not None:
+            quality_output = self.target_quality_refiner(
+                quality_target, cond=cond, dates=date, known_cloud_mask=cloud_mask
+            )
+            if quality_only:
+                return quality_output
+        elif quality_only:
+            raise ValueError("quality_only=True requires target quality refinement and quality_target.")
 
         B, T, C, H, W = x.shape
         # N = int(H * W / self.patch_size ** 2)

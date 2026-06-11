@@ -40,6 +40,16 @@ SDT:                                   # See lib/models/SDT_own for a detailed d
     cross_attention: true   # default true, to use SAR as condition
     cloud_aware_attention: true       # Prefer cloud-free/missing-free tokens as attention context.
     use_cloud_mask_embedding: true    # Explicitly tell the model which patches are unreliable.
+    target_quality_refinement: true   # Detect residual clouds in nominally cloud-free targets during training.
+    target_quality_hidden: 16
+    target_quality_residual_temperature: 0.12
+    target_quality_temporal_scale_days: 45.0
+    target_quality_sar_temperature: 0.5
+
+target_quality:
+    enabled: true
+    warmup_epochs: 100                # Gradually replace suspicious raw targets with temporal consensus.
+    reliability_loss_w: 0.25          # Prevent the learned reliability map from collapsing.
 
 training_settings:
     prediction_type: 'sample'              # Prediction type. ['epsilon', 'sample']

@@ -86,6 +86,7 @@ class Trainer:
 
         self.compute_losses = TrainLoss(self.args.loss)
         self.loss_fn = F.mse_loss
+        self.target_quality_args = self.args.get('target_quality', {})
         # self.compute_metrics = EvalMetrics(self.args.metrics)
 
         # Losses: Initialize statistics
@@ -405,18 +406,71 @@ class Trainer:
         # (this is the forward diffusion process)
         noisy_images = self.noise_scheduler.add_noise(y_0, noise, timesteps)
 
-        # Real cloud/missing pixels are unreliable context even when they were not
-        # selected by the synthetic training mask.
-        quality_mask = torch.maximum(mask, cloud_mask)
+        quality_enabled = self.target_quality_args.get('enabled', True)
+        if quality_enabled:
+            quality_output = self.model(
+                y_0,
+                timesteps,
+                date=date,
+                cond=cond,
+                cloud_mask=cloud_mask,
+                quality_target=y_0,
+                quality_only=True,
+            )
+
+            warmup_epochs = max(
+                int(self.target_quality_args.get('warmup_epochs', 100)), 1
+            )
+            quality_strength = min(float(self.epoch + 1) / warmup_epochs, 1.0)
+            known_clear = 1.0 - cloud_mask
+            learned_reliability = quality_output['reliability']
+            reliability = known_clear * (
+                (1.0 - quality_strength) + quality_strength * learned_reliability
+            )
+
+            # The estimated dirty probability is detached in the input path to
+            # prevent the reliability branch from hiding difficult pixels.
+            estimated_dirty = (1.0 - reliability).detach()
+            quality_mask = torch.maximum(mask, estimated_dirty)
+        else:
+            quality_output = None
+            reliability = 1.0 - cloud_mask
+            quality_mask = torch.maximum(mask, cloud_mask)
+
         model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
         pred_hat = self.model(
             model_input, timesteps, date=date, cond=cond, cloud_mask=quality_mask
         )
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
-        # Only synthetic masked pixels with valid, cloud-free targets are supervised.
-        valid_loss_mask = (mask * (1. - cloud_mask)).expand_as(y_0)
-        squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
-        loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
+        if quality_output is not None:
+            consensus = quality_output['consensus'].detach()
+            support = quality_output['support'].detach()
+            corrected_target = reliability * y_0 + (1.0 - reliability) * consensus
+
+            # When no clean temporal reference exists, the supervision weight
+            # remains low instead of inventing a high-confidence pseudo target.
+            supervision_confidence = (
+                reliability.detach() + (1.0 - reliability.detach()) * support
+            )
+            valid_loss_mask = (mask * supervision_confidence).expand_as(y_0)
+            reconstruction_error = (pred_hat - corrected_target).pow(2)
+            reconstruction_loss = (
+                (reconstruction_error * valid_loss_mask).sum()
+                / valid_loss_mask.sum().clamp_min(1.0)
+            )
+
+            reliability_loss = F.binary_cross_entropy(
+                quality_output['raw_reliability'].clamp(1e-5, 1.0 - 1e-5),
+                quality_output['pseudo_reliability'],
+            )
+            reliability_loss_w = float(
+                self.target_quality_args.get('reliability_loss_w', 0.25)
+            )
+            loss = reconstruction_loss + reliability_loss_w * reliability_loss
+        else:
+            valid_loss_mask = (mask * (1. - cloud_mask)).expand_as(y_0)
+            squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
+            loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
 
         return loss
