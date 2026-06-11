@@ -1,6 +1,6 @@
 data:
     dataset: pastis
-    root: D:/dpmm/DATA/chongqin
+    root: DATA/chongqin
     split: train
     channels: all
     filter_settings:
@@ -31,10 +31,10 @@ SDT:
     cond_in_channels: 2
 
 training_settings:
-    batch_size: 1
+    batch_size: 16
 
 misc:
-    num_workers: 0
+    num_workers: 8
     pin_memory: false
 
 output:
