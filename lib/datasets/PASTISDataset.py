@@ -107,7 +107,8 @@ class PASTISDataset(tdata.Dataset):
         self.max_seq_length = max_seq_length
         self.rescale = rescale
         self.channels = channels
-        self.root = root
+        self.root = resolve_data_root(root, sats)
+        root = self.root
         self.split = split
         self.mask_path = os.path.join(root, mask_dir or "REAL_MASKS")
         self.norm = norm
@@ -145,21 +146,12 @@ class PASTISDataset(tdata.Dataset):
         else:
             self.variable_seq_length = False
 
-        # Get metadata
-        print("Reading patch metadata . . .")
+        # Load dates and build the sample table.
+        print("Reading dates and sample metadata . . .")
         metadata_path = os.path.join(root, "metadata.geojson")
         dates_path = os.path.join(root, dates_file)
         self.dates_by_sat = {}
-        if os.path.exists(metadata_path):
-            self.meta_patch = gpd.read_file(metadata_path)
-            self.meta_patch.index = self.meta_patch["ID_PATCH"].astype(int)
-            self.meta_patch.sort_index(inplace=True)
-            for s in sats:
-                self.dates_by_sat[s] = {
-                    int(pid): prepare_dates(date_seq, self.reference_date)
-                    for pid, date_seq in self.meta_patch["dates-{}".format(s)].items()
-                }
-        elif os.path.exists(dates_path):
+        if os.path.exists(dates_path):
             with open(dates_path, "r", encoding="utf-8") as file:
                 date_config = json.load(file)
             if "reference_date" in date_config:
@@ -190,9 +182,21 @@ class PASTISDataset(tdata.Dataset):
                     raise KeyError("Missing '{}' in {}".format(key, dates_path))
                 values = prepare_date_list(date_config[key], self.reference_date)
                 self.dates_by_sat[s] = {pid: values for pid in patch_ids}
+        elif os.path.exists(metadata_path):
+            self.meta_patch = gpd.read_file(metadata_path)
+            self.meta_patch.index = self.meta_patch["ID_PATCH"].astype(int)
+            self.meta_patch.sort_index(inplace=True)
+            for s in sats:
+                self.dates_by_sat[s] = {
+                    int(pid): prepare_dates(date_seq, self.reference_date)
+                    for pid, date_seq in self.meta_patch["dates-{}".format(s)].items()
+                }
         else:
             raise FileNotFoundError(
-                "Expected either '{}' or '{}'".format(metadata_path, dates_path)
+                "Missing date file '{}'. Custom Chongqing data does not require "
+                "metadata.geojson; place dates.json in the dataset root.".format(
+                    dates_path
+                )
             )
 
         print("Done.")
@@ -624,6 +628,35 @@ def prepare_dates(date_dict, reference_date):
         ).days
     )
     return d.values
+
+
+def resolve_data_root(root, sats):
+    """Find a dataset stored either inside the repository or next to it."""
+    configured = os.path.abspath(os.path.expanduser(root))
+    repository_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..")
+    )
+    candidates = [
+        configured,
+        os.path.abspath(os.path.join(repository_root, root)),
+        os.path.abspath(os.path.join(repository_root, "..", root)),
+    ]
+
+    checked = []
+    for candidate in dict.fromkeys(candidates):
+        checked.append(candidate)
+        if all(
+            os.path.isdir(os.path.join(candidate, "DATA_{}".format(s)))
+            for s in sats
+        ):
+            return candidate
+
+    raise FileNotFoundError(
+        "Dataset folders were not found. Expected {} under one of: {}".format(
+            ", ".join("DATA_{}".format(s) for s in sats),
+            ", ".join(checked),
+        )
+    )
 
 
 def prepare_date_list(date_values, reference_date):
