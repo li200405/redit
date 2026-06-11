@@ -1,5 +1,5 @@
 data:
-    dataset: pastis
+    dataset: chongqing
     root: DATA/chongqin
     split: train
     channels: all
@@ -12,16 +12,14 @@ data:
         shape: ${tuple:64,64}
         type: random
     max_seq_length: 13
-    fixed_seq_length: true
     norm: true
     rescale: true
     ifCTHW: false
-    sats: ["S2", "S1A"]
-    reference_date: "2022-01-01"
     dates_file: dates.json
-    bad_frames_file: low_clear_T_S2_CLEAR.json
-    mask_dir: REAL_MASKS_S2_CLEAR
+    cloudy_indices_file: low_clear_T_S2_CLEAR.json
     date_rescale: true
+    train_ratio: 0.9
+    seed: 0
 
 SDT:
     in_channels: 10
