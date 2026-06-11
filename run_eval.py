@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 import time
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 import torch
 from prodict import Prodict
 from omegaconf import DictConfig, OmegaConf

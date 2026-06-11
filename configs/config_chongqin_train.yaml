@@ -1,0 +1,41 @@
+data:
+    dataset: pastis
+    root: D:/dpmm/DATA/chongqin
+    split: train
+    channels: all
+    filter_settings:
+        type: cloud-free
+        min_length: 10
+        return_valid_obs_only: true
+    crop_settings:
+        enabled: false
+        shape: ${tuple:64,64}
+        type: random
+    max_seq_length: 13
+    fixed_seq_length: true
+    norm: true
+    rescale: true
+    ifCTHW: false
+    sats: ["S2", "S1A"]
+    reference_date: "2022-01-01"
+    dates_file: dates.json
+    bad_frames_file: low_clear_T_S2_CLEAR.json
+    mask_dir: REAL_MASKS_S2_CLEAR
+    date_rescale: true
+
+SDT:
+    in_channels: 10
+    input_size: 128
+    patch_size: 8
+    num_frames: 13
+    cond_in_channels: 2
+
+training_settings:
+    batch_size: 1
+
+misc:
+    num_workers: 0
+    pin_memory: false
+
+output:
+    plot_model_txt: false

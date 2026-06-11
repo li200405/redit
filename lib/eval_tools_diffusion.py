@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import matplotlib
 import os
@@ -354,6 +356,5 @@ def move_temporal_window_next(
                 t_start, t_end = move_temporal_window_end(t_max, temporal_window)
 
     return t_start, t_end
-
 
 

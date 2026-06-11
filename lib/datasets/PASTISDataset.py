@@ -3,6 +3,8 @@ Author: Vivien Sainte Fare Garnot (github.com/VSainteuf)
 License MIT
 """
 
+from __future__ import annotations
+
 import json
 import os
 from datetime import datetime
@@ -41,6 +43,10 @@ class PASTISDataset(tdata.Dataset):
         mono_date=None,
         sats=["S2"],
         date_rescale=False,
+        dates_file="dates.json",
+        bad_frames_file=None,
+        mask_dir=None,
+        fixed_seq_length=True,
     ):
         """
         Pytorch Dataset class to load samples from the PASTIS dataset, for semantic and
@@ -103,7 +109,7 @@ class PASTISDataset(tdata.Dataset):
         self.channels = channels
         self.root = root
         self.split = split
-        self.mask_path = os.path.join(root, "REAL_MASKS")
+        self.mask_path = os.path.join(root, mask_dir or "REAL_MASKS")
         self.norm = norm
         self.reference_date = datetime(*map(int, reference_date.split("-")))
         self.cache = cache
@@ -125,6 +131,8 @@ class PASTISDataset(tdata.Dataset):
         self.target = target
         self.sats = sats
         self.date_rescale = date_rescale
+        self.fixed_seq_length = fixed_seq_length
+        self.data_prefixes = {"S2": "S2", "S1A": "S1", "S1D": "S1D"}
 
         # Image size
         self.crop_settings = crop_settings
@@ -133,37 +141,59 @@ class PASTISDataset(tdata.Dataset):
         # Fixed sequence length? If yes, the `collate_fn` function of the data loader pads samples to the same temporal
         # length before collating them to a batch
         if filter_settings and filter_settings.get('type', None) is not None:
-            self.variable_seq_length = filter_settings.return_valid_obs_only
+            self.variable_seq_length = filter_settings.return_valid_obs_only and not fixed_seq_length
         else:
             self.variable_seq_length = False
 
         # Get metadata
         print("Reading patch metadata . . .")
-        self.meta_patch = gpd.read_file(os.path.join(root, "metadata.geojson"))
-        self.meta_patch.index = self.meta_patch["ID_PATCH"].astype(int)
-        self.meta_patch.sort_index(inplace=True)
-
-        self.date_tables = {s: None for s in sats}
-        self.date_range = np.array(range(-200, 600))
-        for s in sats:
-            dates = self.meta_patch["dates-{}".format(s)]
-            date_table = pd.DataFrame(
-                index=self.meta_patch.index, columns=self.date_range, dtype=int
-            )
-            for pid, date_seq in dates.items():
-                d = pd.DataFrame().from_dict(date_seq, orient="index")
-                d = d[0].apply(
-                    lambda x: (
-                        datetime(int(str(x)[:4]), int(str(x)[4:6]), int(str(x)[6:]))
-                        - self.reference_date
-                    ).days
+        metadata_path = os.path.join(root, "metadata.geojson")
+        dates_path = os.path.join(root, dates_file)
+        self.dates_by_sat = {}
+        if os.path.exists(metadata_path):
+            self.meta_patch = gpd.read_file(metadata_path)
+            self.meta_patch.index = self.meta_patch["ID_PATCH"].astype(int)
+            self.meta_patch.sort_index(inplace=True)
+            for s in sats:
+                self.dates_by_sat[s] = {
+                    int(pid): prepare_dates(date_seq, self.reference_date)
+                    for pid, date_seq in self.meta_patch["dates-{}".format(s)].items()
+                }
+        elif os.path.exists(dates_path):
+            with open(dates_path, "r", encoding="utf-8") as file:
+                date_config = json.load(file)
+            if "reference_date" in date_config:
+                self.reference_date = datetime.strptime(
+                    date_config["reference_date"], "%Y-%m-%d"
                 )
-                date_table.loc[pid, d.values] = 1
-            date_table = date_table.fillna(0)
-            self.date_tables[s] = {
-                index: np.array(list(d.values()))
-                for index, d in date_table.to_dict(orient="index").items()
-            }
+
+            id_sets = []
+            for s in sats:
+                folder = os.path.join(root, "DATA_{}".format(s))
+                prefix = self.data_prefixes.get(s, s)
+                ids = {
+                    int(name[len(prefix) + 1:-4])
+                    for name in os.listdir(folder)
+                    if name.startswith(prefix + "_") and name.endswith(".npy")
+                }
+                id_sets.append(ids)
+            patch_ids = sorted(set.intersection(*id_sets))
+            self.meta_patch = pd.DataFrame(
+                {
+                    "ID_PATCH": patch_ids,
+                    "Fold": [(index % 5) + 1 for index in range(len(patch_ids))],
+                }
+            ).set_index("ID_PATCH", drop=False)
+            for s in sats:
+                key = "dates-{}".format(s)
+                if key not in date_config:
+                    raise KeyError("Missing '{}' in {}".format(key, dates_path))
+                values = prepare_date_list(date_config[key], self.reference_date)
+                self.dates_by_sat[s] = {pid: values for pid in patch_ids}
+        else:
+            raise FileNotFoundError(
+                "Expected either '{}' or '{}'".format(metadata_path, dates_path)
+            )
 
         print("Done.")
 
@@ -185,23 +215,30 @@ class PASTISDataset(tdata.Dataset):
             self.norms = {}
             for s in self.sats:
                 if s != "S2":
-                    with open(
-                        os.path.join(root, "NORM_{}_patch.json".format(s)), "r"
-                    ) as file:
-                        normvals = json.loads(file.read())
-                    selected_folds = folds if folds is not None else range(1, 6)
-                    means = [normvals["Fold_{}".format(f)]["mean"] for f in selected_folds]
-                    stds = [normvals["Fold_{}".format(f)]["std"] for f in selected_folds]
-                    self.norms[s] = np.stack(means).mean(axis=0), np.stack(stds).mean(axis=0)
+                    norm_path = os.path.join(root, "NORM_{}_patch.json".format(s))
+                    if os.path.exists(norm_path):
+                        with open(norm_path, "r") as file:
+                            normvals = json.loads(file.read())
+                        selected_folds = folds if folds is not None else range(1, 6)
+                        means = [normvals["Fold_{}".format(f)]["mean"] for f in selected_folds]
+                        stds = [normvals["Fold_{}".format(f)]["std"] for f in selected_folds]
+                        mean = np.stack(means).mean(axis=0)
+                        std = np.stack(stds).mean(axis=0)
+                    else:
+                        mean = np.array([-15.0, -9.0], dtype=np.float32)
+                        std = np.array([5.0, 5.0], dtype=np.float32)
                     self.norms[s] = (
-                        torch.from_numpy(self.norms[s][0]).float(),
-                        torch.from_numpy(self.norms[s][1]).float(),
+                        torch.from_numpy(mean).float(),
+                        torch.from_numpy(std).float(),
                     )
         else:
             self.norms = None
 
         # Get bad frames
-        with open(os.path.join(root, "bad_frames.json"), "r") as file:
+        bad_frames_path = os.path.join(
+            root, bad_frames_file or "bad_frames.json"
+        )
+        with open(bad_frames_path, "r") as file:
             bad_frames = json.load(file)
         self.bad_frames = {int(k): v for k, v in bad_frames.items()}
 
@@ -233,7 +270,7 @@ class PASTISDataset(tdata.Dataset):
         return self.len
 
     def get_dates(self, id_patch, sat):
-        return self.date_range[np.where(self.date_tables[sat][id_patch] == 1)[0]]
+        return self.dates_by_sat[sat][id_patch]
 
     def __getitem__(self, item):
         id_patch = self.id_patches[item]
@@ -245,7 +282,9 @@ class PASTISDataset(tdata.Dataset):
                     os.path.join(
                         self.root,
                         "DATA_{}".format(satellite),
-                        "{}_{}.npy".format(satellite, id_patch),
+                        "{}_{:06d}.npy".format(
+                            self.data_prefixes.get(satellite, satellite), id_patch
+                        ),
                     )
                 ).astype(np.float32)
                 for satellite in self.sats
@@ -263,7 +302,9 @@ class PASTISDataset(tdata.Dataset):
                         data[s] = torch.clamp(mid, -2, 2) / 2 # SAR data is rescale to [-1, 1]
 
 
-            if self.target == "semantic":
+            if self.target == "semantic" and os.path.isdir(
+                os.path.join(self.root, "ANNOTATIONS")
+            ):
                 target = np.load(
                     os.path.join(
                         self.root, "ANNOTATIONS", "TARGET_{}.npy".format(id_patch)
@@ -274,7 +315,9 @@ class PASTISDataset(tdata.Dataset):
                 if self.class_mapping is not None:
                     target = self.class_mapping(target)
 
-            elif self.target == "instance":
+            elif self.target == "instance" and os.path.isdir(
+                os.path.join(self.root, "INSTANCE_ANNOTATIONS")
+            ):
                 heatmap = np.load(
                     os.path.join(
                         self.root,
@@ -335,6 +378,8 @@ class PASTISDataset(tdata.Dataset):
                         axis=-1,
                     )
                 ).float()
+            else:
+                target = torch.tensor(0, dtype=torch.long)
 
             if self.cache:
                 if self.mem16:
@@ -369,7 +414,7 @@ class PASTISDataset(tdata.Dataset):
                 data = {s: data[s][mono_date[s]].unsqueeze(0) for s in self.sats}
                 dates = {s: dates[s][mono_date[s]] for s in self.sats}
 
-        sample_from_S1 = True
+        sample_from_S1 = False
         if sample_from_S1:
             Num = 35
             t_sampled_ablation = torch.linspace(0, len(data['S1A']) - 1, steps=Num, dtype=torch.long)
@@ -414,13 +459,19 @@ class PASTISDataset(tdata.Dataset):
             data = {k: v.float() for k, v in data.items()}
 
         # masks for training
-        masks_pool = np.load(self.mask_path + "/{}.npy".format(id_patch)) # [T, 1, H, W]
+        mask_candidates = [
+            os.path.join(self.mask_path, "{}.npy".format(id_patch)),
+            os.path.join(self.mask_path, "S2_REAL_MASK_{:06d}.npy".format(id_patch)),
+        ]
+        mask_file = next((path for path in mask_candidates if os.path.exists(path)), None)
+        if mask_file is None:
+            raise FileNotFoundError("No mask file found for patch {}".format(id_patch))
+        masks_pool = np.load(mask_file) # [T, 1, H, W]
         masks_pool = torch.from_numpy(masks_pool).float()
-        # randomly select "len(t_sampled)" frames from masks (T frames)
-        if self.split == 'train':
-            masks = self.select_random_frames(masks_pool, len(t_sampled)) # [len(t_sampled), 1, H, W]
-        else:
-            masks = self.select_fixed_frames(masks_pool, len(t_sampled))
+        mask_indices = self.select_mask_indices_by_coverage(
+            masks_pool, len(t_sampled), self.split
+        )
+        masks = masks_pool[mask_indices]
         # masks: (0: clear; 1: Thick cloud; 2: Thin cloud; 3: Cloud shadow)
         masks = torch.where(masks > 0, 1.0, masks)
 
@@ -505,18 +556,63 @@ class PASTISDataset(tdata.Dataset):
             t_start = np.random.choice(np.arange(0, len(t_sampled) - self.max_seq_length + 1))
             t_end = t_start + self.max_seq_length
             t_sampled = t_sampled[t_start:t_end]
+        elif (
+            self.fixed_seq_length
+            and self.max_seq_length is not None
+            and len(t_sampled) < self.max_seq_length
+        ):
+            selected = set(t_sampled.tolist())
+            available = [i for i in range(seq_length) if i not in selected]
+            needed = self.max_seq_length - len(t_sampled)
+            if self.split == "train":
+                np.random.shuffle(available)
+            t_sampled = torch.tensor(
+                sorted(t_sampled.tolist() + available[:needed]), dtype=torch.long
+            )
 
         return t_sampled
 
-    def select_random_frames(self, mask, num_frames):
-        T = mask.shape[0]
-        indices = torch.randperm(T)[:num_frames]
-        selected_frames = torch.index_select(mask, 0, indices)
-        return selected_frames
-    def select_fixed_frames(self, mask, num_frames):
-        indices = torch.arange(0, num_frames)
-        selected_frames = torch.index_select(mask, 0, indices)
-        return selected_frames
+    @staticmethod
+    def select_mask_indices_by_coverage(
+        masks_pool: torch.Tensor, num_frames: int, split: str
+    ) -> torch.Tensor:
+        """Sample masks from the current sample's pool by cloud coverage."""
+        all_indices = torch.arange(masks_pool.shape[0], dtype=torch.long)
+        coverages = (masks_pool > 0).float().mean(dim=(1, 2, 3))
+        buckets = [
+            all_indices[(coverages >= 0.10) & (coverages < 0.60)],
+            all_indices[(coverages >= 0.60) & (coverages < 0.80)],
+            all_indices[(coverages >= 0.80) & (coverages < 0.95)],
+            all_indices[(coverages >= 0.95) & (coverages <= 1.00)],
+        ]
+        available_bucket_ids = [
+            index for index, bucket in enumerate(buckets) if bucket.numel() > 0
+        ]
+
+        if not available_bucket_ids:
+            buckets = [all_indices]
+            available_bucket_ids = [0]
+
+        if split == "train":
+            bucket_probs = torch.tensor(
+                [0.65, 0.25, 0.07, 0.03], dtype=torch.float32
+            )
+            bucket_probs = bucket_probs[available_bucket_ids]
+            bucket_probs = bucket_probs / bucket_probs.sum()
+            sampled_bucket_positions = torch.multinomial(
+                bucket_probs, num_frames, replacement=True
+            )
+
+            selected = []
+            for position in sampled_bucket_positions.tolist():
+                bucket = buckets[available_bucket_ids[position]]
+                random_position = torch.randint(0, bucket.numel(), (1,)).item()
+                selected.append(bucket[random_position])
+            return torch.stack(selected).long()
+
+        ordered = torch.cat([buckets[index] for index in available_bucket_ids])
+        repeats = int(np.ceil(num_frames / ordered.numel()))
+        return ordered.repeat(repeats)[:num_frames]
 
 def prepare_dates(date_dict, reference_date):
     """Date formating."""
@@ -528,6 +624,20 @@ def prepare_dates(date_dict, reference_date):
         ).days
     )
     return d.values
+
+
+def prepare_date_list(date_values, reference_date):
+    """Convert a shared YYYYMMDD date list to day offsets."""
+    return np.array(
+        [
+            (
+                datetime.strptime(str(value), "%Y%m%d")
+                - reference_date
+            ).days
+            for value in date_values
+        ],
+        dtype=np.int64,
+    )
 
 
 def match_sequences_tensor(A, B):

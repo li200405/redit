@@ -2,7 +2,6 @@ import argparse
 import logging
 import logging.config
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '3,2,1,0'
 import sys
 from argparse import ArgumentParser
 
