@@ -294,7 +294,7 @@ class CrossAttentionBlock(nn.Module):
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, c, SAR):
+    def forward(self, x, c, SAR, token_focus=None):
         # c   [B, M]
         # x   [(B T), N, M]
         # SAR [(B T), N, M]
@@ -318,6 +318,8 @@ class CrossAttentionBlock(nn.Module):
         res_cross = rearrange(res_cross, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
         res_cross = gate_ca.unsqueeze(1) * res_cross
         res_cross = rearrange(res_cross, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if token_focus is not None:
+            res_cross = res_cross * token_focus.unsqueeze(-1)
 
         x = x + res_cross # (b t) n m
 
@@ -349,7 +351,7 @@ class TemporalBlock(nn.Module):
         )
         self.num_frames = num_frames
 
-    def forward(self, x, c, cloud_mask=None):
+    def forward(self, x, c, cloud_mask=None, token_focus=None):
         shift_mta, scale_mta, gate_mta = self.adaLN_modulation(c).chunk(3, dim=1)
         T = self.num_frames
         K, N, M = x.shape
@@ -368,6 +370,8 @@ class TemporalBlock(nn.Module):
         res_temporal = rearrange(res_temporal, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
         res_temporal = gate_mta.unsqueeze(1) * res_temporal
         res_temporal = rearrange(res_temporal, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if token_focus is not None:
+            res_temporal = res_temporal * token_focus.unsqueeze(-1)
         # x = rearrange(x, '(b n) t m -> (b t) n m', b=B, t=T, n=N, m=M)
         x = x + res_temporal
 
@@ -393,7 +397,7 @@ class SpatialBlock(nn.Module):
         )
         self.num_frames = num_frames
 
-    def forward(self, x, c, cloud_mask=None):
+    def forward(self, x, c, cloud_mask=None, token_focus=None):
         shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
         T = self.num_frames
         K, N, M = x.shape
@@ -403,6 +407,8 @@ class SpatialBlock(nn.Module):
         attn = rearrange(attn, '(b t) n m-> b (t n) m', b=B, t=T, n=N, m=M)
         attn = gate_msa.unsqueeze(1) * attn
         attn = rearrange(attn, 'b (t n) m-> (b t) n m', b=B, t=T, n=N, m=M)
+        if token_focus is not None:
+            attn = attn * token_focus.unsqueeze(-1)
         x = x + attn
 
         return x
@@ -437,16 +443,16 @@ class ConditionTS_Block(nn.Module):
         )
         self.num_frames = num_frames
         self.ifCrossAttention = if_cross_attention
-    def forward(self, x, c, SAR, cloud_mask=None):
+    def forward(self, x, c, SAR, cloud_mask=None, token_focus=None):
 
         T = self.num_frames
         K, N, M = x.shape
         B = K // T
 
         if self.ifCrossAttention:
-            x = self.CrossAttentionBlock(x, c, SAR)
-        x = self.TemporalBlock(x, c, cloud_mask)
-        x = self.SpatialBlock(x, c, cloud_mask)
+            x = self.CrossAttentionBlock(x, c, SAR, token_focus)
+        x = self.TemporalBlock(x, c, cloud_mask, token_focus)
+        x = self.SpatialBlock(x, c, cloud_mask, token_focus)
 
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=1)
         mlp = self.mlp(modulate(self.norm(x), shift_mlp, scale_mlp, self.num_frames))
@@ -631,6 +637,115 @@ class TargetQualityRefiner(nn.Module):
         }
 
 
+class TemporalStabilityPlanner(nn.Module):
+    """Builds a spatial focus map from full-sequence S2 and S1 change."""
+
+    def __init__(
+            self,
+            optical_threshold=0.04,
+            sar_threshold=0.10,
+            optical_temperature=0.02,
+            sar_temperature=0.04,
+            spatial_kernel=5,
+            attention_floor=0.25,
+    ):
+        super().__init__()
+        self.optical_threshold = optical_threshold
+        self.sar_threshold = sar_threshold
+        self.optical_temperature = optical_temperature
+        self.sar_temperature = sar_temperature
+        self.spatial_kernel = spatial_kernel
+        self.attention_floor = attention_floor
+
+    def _smooth(self, value):
+        if self.spatial_kernel <= 1:
+            return value
+        padding = self.spatial_kernel // 2
+        value = torch.nn.functional.pad(
+            value, (padding, padding, padding, padding), mode="replicate"
+        )
+        return torch.nn.functional.avg_pool2d(
+            value,
+            kernel_size=self.spatial_kernel,
+            stride=1,
+        )
+
+    def forward(self, optical, cond=None, cloud_mask=None):
+        B, T, _, H, W = optical.shape
+        if T <= 1:
+            dynamic_focus = torch.ones(
+                (B, 1, 1, H, W),
+                dtype=optical.dtype,
+                device=optical.device,
+            )
+            return self._format_output(dynamic_focus, T)
+
+        if cloud_mask is None:
+            clear = torch.ones(
+                (B, T, 1, H, W),
+                dtype=optical.dtype,
+                device=optical.device,
+            )
+        else:
+            clear = 1.0 - cloud_mask.float().clamp(0, 1)
+
+        pair_clear = clear[:, 1:] * clear[:, :-1]
+        optical_change = (
+            optical[:, 1:] - optical[:, :-1]
+        ).abs().mean(dim=2, keepdim=True)
+        optical_weight = pair_clear.sum(dim=1)
+        optical_change = (
+            (optical_change * pair_clear).sum(dim=1)
+            / optical_weight.clamp_min(1e-6)
+        )
+        optical_change = self._smooth(optical_change)
+        optical_support = (
+            optical_weight / max(T - 1, 1)
+        ).clamp(0, 1)
+        optical_focus = torch.sigmoid(
+            (optical_change - self.optical_threshold)
+            / max(self.optical_temperature, 1e-6)
+        )
+
+        if cond is not None and cond.shape[1] == T:
+            sar_change = (
+                cond[:, 1:] - cond[:, :-1]
+            ).abs().mean(dim=2).mean(dim=1, keepdim=True)
+            sar_change = self._smooth(sar_change)
+            sar_focus = torch.sigmoid(
+                (sar_change - self.sar_threshold)
+                / max(self.sar_temperature, 1e-6)
+            )
+            supported_focus = torch.maximum(optical_focus, sar_focus)
+            dynamic_focus = (
+                optical_support * supported_focus
+                + (1.0 - optical_support) * sar_focus
+            )
+        else:
+            dynamic_focus = (
+                optical_support * optical_focus
+                + (1.0 - optical_support)
+            )
+
+        dynamic_focus = dynamic_focus.clamp(0, 1).unsqueeze(1)
+        return self._format_output(dynamic_focus, T)
+
+    def _format_output(self, dynamic_focus, num_frames):
+        attention_weight = (
+            self.attention_floor
+            + (1.0 - self.attention_floor) * dynamic_focus
+        )
+        return {
+            "dynamic_focus": dynamic_focus.expand(
+                -1, num_frames, -1, -1, -1
+            ),
+            "stability_map": 1.0 - dynamic_focus,
+            "attention_weight": attention_weight.expand(
+                -1, num_frames, -1, -1, -1
+            ),
+        }
+
+
 class SDT(nn.Module):
     """
     Sequential Denoising Transformer.
@@ -658,6 +773,13 @@ class SDT(nn.Module):
             target_quality_residual_temperature=0.12,
             target_quality_temporal_scale_days=45.0,
             target_quality_sar_temperature=0.5,
+            temporal_stability_suppression=False,
+            stability_optical_threshold=0.04,
+            stability_sar_threshold=0.10,
+            stability_optical_temperature=0.02,
+            stability_sar_temperature=0.04,
+            stability_spatial_kernel=5,
+            stability_attention_floor=0.25,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -669,6 +791,7 @@ class SDT(nn.Module):
         self.cloud_aware_attention = cloud_aware_attention
         self.use_cloud_mask_embedding = use_cloud_mask_embedding
         self.target_quality_refinement = target_quality_refinement
+        self.temporal_stability_suppression = temporal_stability_suppression
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.cond_embedder = PatchEmbed(input_size, patch_size, cond_in_channels, hidden_size, bias=True)
@@ -682,6 +805,14 @@ class SDT(nn.Module):
             temporal_scale_days=target_quality_temporal_scale_days,
             sar_temperature=target_quality_sar_temperature,
         ) if target_quality_refinement else None
+        self.temporal_stability_planner = TemporalStabilityPlanner(
+            optical_threshold=stability_optical_threshold,
+            sar_threshold=stability_sar_threshold,
+            optical_temperature=stability_optical_temperature,
+            sar_temperature=stability_sar_temperature,
+            spatial_kernel=stability_spatial_kernel,
+            attention_floor=stability_attention_floor,
+        ) if temporal_stability_suppression else None
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -785,6 +916,8 @@ class SDT(nn.Module):
             semantics=None,
             quality_target=None,
             quality_only=False,
+            stability_source=None,
+            return_aux=False,
     ):
         """
         Forward pass of SDT.
@@ -804,6 +937,23 @@ class SDT(nn.Module):
             raise ValueError("quality_only=True requires target quality refinement and quality_target.")
 
         B, T, C, H, W = x.shape
+        stability_output = None
+        token_focus = None
+        if self.temporal_stability_planner is not None:
+            stability_output = self.temporal_stability_planner(
+                stability_source if stability_source is not None else x,
+                cond=cond,
+                cloud_mask=cloud_mask,
+            )
+            attention_weight = stability_output["attention_weight"]
+            attention_weight = attention_weight.reshape(B * T, 1, H, W)
+            patch_size = self.x_embedder.patch_size[0]
+            token_focus = torch.nn.functional.avg_pool2d(
+                attention_weight,
+                kernel_size=patch_size,
+                stride=patch_size,
+            ).flatten(1).clamp(0, 1)
+
         # N = int(H * W / self.patch_size ** 2)
         x = x.contiguous().view(-1, C, H, W)
         x = self.x_embedder(x) + self.pos_embed  # ((B T), N, M), where N = H * W / patch_size ** 2
@@ -860,14 +1010,27 @@ class SDT(nn.Module):
 
 
         attn_cloud_mask = cloud_mask_tokens if self.cloud_aware_attention else None
+        if token_focus is not None:
+            stability_suppression = 1.0 - token_focus
+            if attn_cloud_mask is None:
+                attn_cloud_mask = stability_suppression
+            else:
+                attn_cloud_mask = torch.maximum(
+                    attn_cloud_mask, stability_suppression
+                )
         for block in self.blocks:
-            x = block(x, c, cond, attn_cloud_mask)
+            x = block(x, c, cond, attn_cloud_mask, token_focus)
 
 
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
 
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         x = x.view(B, T, x.shape[-3], x.shape[-2], x.shape[-1])
+        if return_aux:
+            output = {"prediction": x}
+            if stability_output is not None:
+                output.update(stability_output)
+            return output
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):

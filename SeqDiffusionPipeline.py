@@ -48,14 +48,29 @@ class SeqDiffusionPipeline(DiffusionPipeline):
                 model_cloud_mask = quality_mask if quality_mask is not None else mask
                 if cond is not None and batch_positions is not None:
                     model_output = self.model(
-                        unet_input, t, batch_positions, cond, cloud_mask=model_cloud_mask
+                        unet_input,
+                        t,
+                        batch_positions,
+                        cond,
+                        cloud_mask=model_cloud_mask,
+                        stability_source=image,
                     )
                 elif cond is not None and batch_positions is None:
                     model_output = self.model(
-                        unet_input, t, date=None, cond=cond, cloud_mask=model_cloud_mask
+                        unet_input,
+                        t,
+                        date=None,
+                        cond=cond,
+                        cloud_mask=model_cloud_mask,
+                        stability_source=image,
                     )
                 else:
-                    model_output = self.model(unet_input, t, cloud_mask=model_cloud_mask)
+                    model_output = self.model(
+                        unet_input,
+                        t,
+                        cloud_mask=model_cloud_mask,
+                        stability_source=image,
+                    )
             # 2. predict previous mean of image x_t-1 and add variance depending on eta
             # eta corresponds to η in paper and should be between [0, 1]
             # do x_t -> x_t-1
@@ -92,5 +107,4 @@ class SeqDiffusionPipeline(DiffusionPipeline):
             return (output_image,)
 
         return ImagePipelineOutput(images=output_image)
-
 
