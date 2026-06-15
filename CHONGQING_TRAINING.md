@@ -49,3 +49,34 @@ Run on GPUs 6, 7, and 8:
 ```bash
 CUDA_VISIBLE_DEVICES=6,7,8 python run_train_PASTIS.py configs/config_chongqin_train.yaml --save_dir ./results/
 ```
+
+## Reconstruct one NPY sample
+
+Open:
+
+```text
+run_reconstruct_single.py
+```
+
+Edit the paths in its `USER SETTINGS` section:
+
+```python
+CONFIG_PATH = r"results/experiment/config.yaml"
+CHECKPOINT_PATH = r"results/experiment/checkpoints/Model_best.pth"
+DATA_ROOT = r"DATA/chongqin"
+S2_PATH = r"DATA/chongqin/DATA_S2/S2_000093.npy"
+OUTPUT_PATH = r"results/reconstruction/S2_000093_reconstructed.npy"
+```
+
+`S1_PATH`, `MASK_PATH`, and `DATES_PATH` can remain `None`; matching files
+are found automatically from the S2 sample ID.
+
+Run the file directly from an IDE or use:
+
+```bash
+python run_reconstruct_single.py
+```
+
+The script reconstructs the complete 30-frame sequence with overlapping
+13-frame windows. By default, only masked pixels are replaced and clear
+pixels retain their original S2 values.
