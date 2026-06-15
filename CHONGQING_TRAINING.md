@@ -78,5 +78,7 @@ python run_reconstruct_single.py
 ```
 
 The script reconstructs the complete 30-frame sequence with overlapping
-13-frame windows. By default, only masked pixels are replaced and clear
-pixels retain their original S2 values.
+13-frame windows. Overlapping predictions use the same minimum-difference
+switching strategy as the original reconstruction script instead of being
+averaged. By default, only masked pixels are replaced and clear pixels retain
+their original S2 values.

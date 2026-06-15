@@ -9,6 +9,7 @@ from an IDE or with:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -25,12 +26,12 @@ from lib.models.SDT import SDT
 # ============================== USER SETTINGS ==============================
 
 # Use the config.yaml saved in the same experiment directory as the checkpoint.
-CONFIG_PATH = r"results/2026-06-11_15-05/config.yaml"
-CHECKPOINT_PATH = r"results/2026-06-11_15-05/checkpoints/Model_best.pth"
+CONFIG_PATH = r"results/2026-06-11_15-15/config.yaml"
+CHECKPOINT_PATH = r"results/2026-06-11_15-15/checkpoints/Model_best.pth"
 
 # Dataset root and the single S2 file to reconstruct.
-DATA_ROOT = r"DATA/chongqin"
-S2_PATH = r"DATA/chongqin/DATA_S2/S2_000093.npy"
+DATA_ROOT = r"D:\dpmm\DATA\chongqin"
+S2_PATH = r"D:\dpmm\DATA\chongqin\DATA_S2\S2_004857.npy"
 
 # Leave these as None to find the matching files automatically from S2_PATH.
 S1_PATH = None
@@ -38,17 +39,16 @@ MASK_PATH = None
 DATES_PATH = None
 
 # Output settings.
-OUTPUT_PATH = r"results/reconstruction/S2_000093_reconstructed.npy"
+OUTPUT_PATH = r"results/reconstruction/S2_004857_reconstructed.npy"
 SAVE_PREDICTION_ONLY_PATH = None
 
 # Diffusion/sliding-window settings.
-INFERENCE_STEPS = 20
-WINDOW_STRIDE = 6
+INFERENCE_STEPS = 1
 RANDOM_SEED = 0
 
 # True: retain original pixels outside mask and replace only masked pixels.
 # False: save the generated result over the entire image.
-PRESERVE_CLEAR_PIXELS = True
+PRESERVE_CLEAR_PIXELS = False
 
 # Convert model output [0, 1] back to the S2 reflectance scale used in training.
 OUTPUT_SCALE = 8000.0
@@ -110,14 +110,35 @@ def load_checkpoint(model, checkpoint_path, device):
     return epoch
 
 
-def window_starts(seq_length, window_size, stride):
-    if seq_length <= window_size:
-        return [0]
-    starts = list(range(0, seq_length - window_size + 1, stride))
-    final_start = seq_length - window_size
-    if starts[-1] != final_start:
-        starts.append(final_start)
-    return starts
+def move_window_to_end(seq_length, window_size):
+    return seq_length - window_size, seq_length
+
+
+def move_window_next(start, seq_length, window_size, cloud_coverage):
+    """Move the window using the same low-cloud boundary rule as old inference."""
+    stride = window_size // 2
+    candidate_start = start + stride
+
+    if candidate_start + window_size > seq_length:
+        return move_window_to_end(seq_length, window_size)
+
+    if cloud_coverage[candidate_start] <= 0.1:
+        return candidate_start, candidate_start + window_size
+
+    search_radius = math.ceil(stride / 2)
+    left = max(0, candidate_start - search_radius)
+    right = min(candidate_start + search_radius + 1, seq_length)
+    local_coverage = cloud_coverage[left:right]
+    candidates = (
+        local_coverage == local_coverage.min()
+    ).nonzero(as_tuple=True)[0] + left
+    next_start = candidates[
+        torch.abs(candidates - candidate_start).argmin()
+    ].item()
+    next_end = next_start + window_size
+    if next_end > seq_length:
+        return move_window_to_end(seq_length, window_size)
+    return next_start, next_end
 
 
 def reconstruct_windows(
@@ -127,20 +148,18 @@ def reconstruct_windows(
     dates,
     cond,
     window_size,
-    stride,
     inference_steps,
     seed,
 ):
     seq_length = image.shape[1]
-    prediction_sum = torch.zeros_like(image)
-    prediction_count = torch.zeros(
-        (1, seq_length, 1, 1, 1), device=image.device
-    )
+    generator = torch.Generator(device="cpu").manual_seed(seed)
 
-    for window_index, start in enumerate(
-        window_starts(seq_length, window_size, stride)
-    ):
-        end = min(start + window_size, seq_length)
+    if seq_length <= window_size:
+        starts = [0]
+    else:
+        starts = None
+
+    def predict_window(start, end):
         valid_length = end - start
 
         image_window = image[:, start:end]
@@ -202,9 +221,6 @@ def reconstruct_windows(
                 dim=1,
             )
 
-        generator = torch.Generator(device="cpu").manual_seed(
-            seed + window_index
-        )
         prediction = pipeline(
             image=image_window,
             mask=mask_window,
@@ -216,15 +232,67 @@ def reconstruct_windows(
             return_dict=False,
             quality_mask=mask_window,
         )
-        prediction = prediction[:, :valid_length]
-        prediction_sum[:, start:end] += prediction
-        prediction_count[:, start:end] += 1
+        return prediction[:, :valid_length]
 
+    if starts is not None:
+        prediction = predict_window(0, seq_length)
+        print("Reconstructed frames 00-{:02d}".format(seq_length - 1))
+        return prediction
+
+    cloud_coverage = mask.mean(dim=(0, 2, 3, 4))
+    start = 0
+    end = window_size
+    prediction_full = torch.zeros_like(image)
+    previous_start = None
+    previous_end = None
+
+    while True:
+        prediction_window = predict_window(start, end)
         print(
             "Reconstructed frames {:02d}-{:02d}".format(start, end - 1)
         )
 
-    return prediction_sum / prediction_count.clamp_min(1)
+        if previous_start is None:
+            prediction_full[:, start:end] = prediction_window
+        else:
+            overlap_start = max(previous_start, start)
+            overlap_end = min(previous_end, end)
+            overlap_indices = torch.arange(
+                overlap_start, overlap_end, device=image.device
+            )
+
+            if overlap_indices.numel() > 0:
+                old_prediction = prediction_full[:, overlap_indices]
+                new_prediction = prediction_window[
+                    :, overlap_indices - start
+                ]
+                difference = torch.mean(
+                    torch.abs(old_prediction - new_prediction),
+                    dim=(0, 2, 3, 4),
+                )
+                switch_frame = (
+                    difference.argmin().item() + overlap_start
+                )
+            else:
+                switch_frame = start
+
+            prediction_full[:, switch_frame:end] = prediction_window[
+                :, switch_frame - start:
+            ]
+
+        if end == seq_length:
+            break
+
+        previous_start = start
+        previous_end = end
+        next_start, next_end = move_window_next(
+            start, seq_length, window_size, cloud_coverage
+        )
+        if next_start == start and next_end == end:
+            raise RuntimeError("Sliding window did not advance.")
+        start, end = next_start, next_end
+
+    return prediction_full
 
 
 def main():
@@ -348,7 +416,6 @@ def main():
             dates=positions,
             cond=cond,
             window_size=int(config.SDT.num_frames),
-            stride=WINDOW_STRIDE,
             inference_steps=INFERENCE_STEPS,
             seed=RANDOM_SEED,
         )
@@ -356,15 +423,28 @@ def main():
     prediction = (
         prediction_01.squeeze(0).cpu().numpy() * OUTPUT_SCALE
     ).astype(np.float32)
-    binary_mask = (mask_original > 0).astype(np.float32)
+    prediction = np.nan_to_num(
+        prediction, nan=0.0, posinf=OUTPUT_SCALE, neginf=0.0
+    )
+    prediction = np.clip(prediction, 0.0, OUTPUT_SCALE)
+    binary_mask = mask_original > 0
+    expanded_mask = np.broadcast_to(binary_mask, s2_original.shape)
 
     if PRESERVE_CLEAR_PIXELS:
-        reconstructed = (
-            s2_original * (1.0 - binary_mask)
-            + prediction * binary_mask
-        )
+        reconstructed = np.where(
+            expanded_mask, prediction, s2_original
+        ).astype(np.float32)
     else:
         reconstructed = prediction
+
+    clear_pixels = ~expanded_mask
+    if PRESERVE_CLEAR_PIXELS and np.any(clear_pixels):
+        clear_difference = np.abs(
+            reconstructed[clear_pixels] - s2_original[clear_pixels]
+        )
+        max_clear_difference = float(clear_difference.max())
+    else:
+        max_clear_difference = float("nan")
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.save(output_path, reconstructed.astype(np.float32))
@@ -381,6 +461,9 @@ def main():
     print("Checkpoint epoch: {}".format(epoch))
     print("Input shape: {}".format(s2_original.shape))
     print("Output shape: {}".format(reconstructed.shape))
+    print(
+        "Maximum difference outside mask: {}".format(max_clear_difference)
+    )
     print("Saved to: {}".format(output_path))
 
 
