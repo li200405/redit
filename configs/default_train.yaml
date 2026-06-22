@@ -45,22 +45,11 @@ SDT:                                   # See lib/models/SDT_own for a detailed d
     target_quality_residual_temperature: 0.12
     target_quality_temporal_scale_days: 45.0
     target_quality_sar_temperature: 0.5
-    temporal_stability_suppression: false
-    stability_optical_threshold: 0.04
-    stability_sar_threshold: 0.10
-    stability_optical_temperature: 0.02
-    stability_sar_temperature: 0.04
-    stability_spatial_kernel: 5
-    stability_attention_floor: 0.25
 
 target_quality:
     enabled: true
     warmup_epochs: 100                # Gradually replace suspicious raw targets with temporal consensus.
     reliability_loss_w: 0.25          # Prevent the learned reliability map from collapsing.
-
-temporal_stability:
-    enabled: false
-    loss_floor: 0.25                  # Stable pixels keep this fraction of reconstruction loss.
 
 training_settings:
     prediction_type: 'sample'              # Prediction type. ['epsilon', 'sample']

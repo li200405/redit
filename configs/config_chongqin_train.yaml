@@ -27,17 +27,6 @@ SDT:
     patch_size: 8
     num_frames: 13
     cond_in_channels: 2
-    temporal_stability_suppression: true
-    stability_optical_threshold: 0.04
-    stability_sar_threshold: 0.10
-    stability_optical_temperature: 0.02
-    stability_sar_temperature: 0.04
-    stability_spatial_kernel: 5
-    stability_attention_floor: 0.25
-
-temporal_stability:
-    enabled: true
-    loss_floor: 0.25
 
 training_settings:
     batch_size: 16
