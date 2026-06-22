@@ -23,6 +23,7 @@ A Condition_TSBlock made up of:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -294,7 +295,7 @@ class CrossAttentionBlock(nn.Module):
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, c, SAR):
+    def forward(self, x, c, SAR, sar_gate=None):
         # c   [B, M]
         # x   [(B T), N, M]
         # SAR [(B T), N, M]
@@ -318,6 +319,8 @@ class CrossAttentionBlock(nn.Module):
         res_cross = rearrange(res_cross, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
         res_cross = gate_ca.unsqueeze(1) * res_cross
         res_cross = rearrange(res_cross, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if sar_gate is not None:
+            res_cross = res_cross * sar_gate.unsqueeze(-1)
 
         x = x + res_cross # (b t) n m
 
@@ -349,7 +352,7 @@ class TemporalBlock(nn.Module):
         )
         self.num_frames = num_frames
 
-    def forward(self, x, c, cloud_mask=None):
+    def forward(self, x, c, cloud_mask=None, temporal_gate=None):
         shift_mta, scale_mta, gate_mta = self.adaLN_modulation(c).chunk(3, dim=1)
         T = self.num_frames
         K, N, M = x.shape
@@ -368,6 +371,8 @@ class TemporalBlock(nn.Module):
         res_temporal = rearrange(res_temporal, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
         res_temporal = gate_mta.unsqueeze(1) * res_temporal
         res_temporal = rearrange(res_temporal, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if temporal_gate is not None:
+            res_temporal = res_temporal * temporal_gate.unsqueeze(-1)
         # x = rearrange(x, '(b n) t m -> (b t) n m', b=B, t=T, n=N, m=M)
         x = x + res_temporal
 
@@ -393,7 +398,7 @@ class SpatialBlock(nn.Module):
         )
         self.num_frames = num_frames
 
-    def forward(self, x, c, cloud_mask=None):
+    def forward(self, x, c, cloud_mask=None, spatial_gate=None):
         shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
         T = self.num_frames
         K, N, M = x.shape
@@ -403,6 +408,8 @@ class SpatialBlock(nn.Module):
         attn = rearrange(attn, '(b t) n m-> b (t n) m', b=B, t=T, n=N, m=M)
         attn = gate_msa.unsqueeze(1) * attn
         attn = rearrange(attn, 'b (t n) m-> (b t) n m', b=B, t=T, n=N, m=M)
+        if spatial_gate is not None:
+            attn = attn * spatial_gate.unsqueeze(-1)
         x = x + attn
 
         return x
@@ -437,16 +444,24 @@ class ConditionTS_Block(nn.Module):
         )
         self.num_frames = num_frames
         self.ifCrossAttention = if_cross_attention
-    def forward(self, x, c, SAR, cloud_mask=None):
+    def forward(self, x, c, SAR, cloud_mask=None, landcover_gates=None):
 
         T = self.num_frames
         K, N, M = x.shape
         B = K // T
 
+        sar_gate = None
+        temporal_gate = None
+        spatial_gate = None
+        if landcover_gates is not None:
+            sar_gate = landcover_gates.get("sar")
+            temporal_gate = landcover_gates.get("temporal")
+            spatial_gate = landcover_gates.get("spatial")
+
         if self.ifCrossAttention:
-            x = self.CrossAttentionBlock(x, c, SAR)
-        x = self.TemporalBlock(x, c, cloud_mask)
-        x = self.SpatialBlock(x, c, cloud_mask)
+            x = self.CrossAttentionBlock(x, c, SAR, sar_gate=sar_gate)
+        x = self.TemporalBlock(x, c, cloud_mask, temporal_gate=temporal_gate)
+        x = self.SpatialBlock(x, c, cloud_mask, spatial_gate=spatial_gate)
 
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=1)
         mlp = self.mlp(modulate(self.norm(x), shift_mlp, scale_mlp, self.num_frames))
@@ -631,6 +646,168 @@ class TargetQualityRefiner(nn.Module):
         }
 
 
+class LandCoverRouter(nn.Module):
+    """
+    Rule-guided soft land-cover router.
+
+    The router does not require external land-cover labels. It estimates soft
+    patch categories from S2 vegetation dynamics and SAR/optical structure,
+    then maps them to separate gates for temporal, SAR cross, and spatial
+    attention.
+    """
+
+    def __init__(
+            self,
+            red_index=2,
+            nir_index=6,
+            min_gate=0.25,
+            built_temporal_gate=0.35,
+            built_sar_gate=1.00,
+            built_spatial_gate=1.00,
+            crop_temporal_gate=1.00,
+            crop_sar_gate=0.60,
+            crop_spatial_gate=0.70,
+            forest_temporal_gate=0.65,
+            forest_sar_gate=0.50,
+            forest_spatial_gate=0.80,
+            other_temporal_gate=0.55,
+            other_sar_gate=0.70,
+            other_spatial_gate=0.65,
+    ):
+        super().__init__()
+        self.red_index = red_index
+        self.nir_index = nir_index
+        self.min_gate = min_gate
+        self.temporal_values = (
+            built_temporal_gate,
+            crop_temporal_gate,
+            forest_temporal_gate,
+            other_temporal_gate,
+        )
+        self.sar_values = (
+            built_sar_gate,
+            crop_sar_gate,
+            forest_sar_gate,
+            other_sar_gate,
+        )
+        self.spatial_values = (
+            built_spatial_gate,
+            crop_spatial_gate,
+            forest_spatial_gate,
+            other_spatial_gate,
+        )
+
+    @staticmethod
+    def _to_unit_range(value):
+        value = value.float()
+        if value.detach().amin() < -0.05:
+            value = (value + 1.0) / 2.0
+        return value.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _weighted_mean(value, valid):
+        denom = valid.sum(dim=1).clamp_min(1e-6)
+        return (value * valid).sum(dim=1) / denom
+
+    @staticmethod
+    def _weighted_change(value, valid):
+        if value.shape[1] <= 1:
+            return torch.zeros_like(value[:, 0])
+        pair_valid = valid[:, 1:] * valid[:, :-1]
+        diff = (value[:, 1:] - value[:, :-1]).abs()
+        denom = pair_valid.sum(dim=1).clamp_min(1e-6)
+        return (diff * pair_valid).sum(dim=1) / denom
+
+    @staticmethod
+    def _edge_strength(value):
+        kernel_x = value.new_tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3) / 4.0
+        kernel_y = kernel_x.transpose(-1, -2)
+        grad_x = F.conv2d(value, kernel_x, padding=1)
+        grad_y = F.conv2d(value, kernel_y, padding=1)
+        return (grad_x.abs() + grad_y.abs()).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _sigmoid_score(value, center, temperature):
+        return torch.sigmoid((value - center) / max(temperature, 1e-6))
+
+    def _class_probabilities(self, optical, cond=None, cloud_mask=None):
+        B, T, C, H, W = optical.shape
+        optical = self._to_unit_range(optical)
+        if cloud_mask is None:
+            clear = torch.ones((B, T, 1, H, W), device=optical.device, dtype=optical.dtype)
+        else:
+            clear = 1.0 - cloud_mask.float().clamp(0.0, 1.0)
+
+        red_idx = min(max(self.red_index, 0), C - 1)
+        nir_idx = min(max(self.nir_index, 0), C - 1)
+        red = optical[:, :, red_idx:red_idx + 1]
+        nir = optical[:, :, nir_idx:nir_idx + 1]
+        ndvi = ((nir - red) / (nir + red + 1e-6)).clamp(-1.0, 1.0)
+        mean_ndvi = self._weighted_mean(ndvi, clear)
+        ndvi_change = self._weighted_change(ndvi, clear)
+        mean_nir = self._weighted_mean(nir, clear)
+
+        rgb_like = optical[:, :, :min(3, C)].mean(dim=2, keepdim=True)
+        mean_rgb = self._weighted_mean(rgb_like, clear)
+        optical_edge = self._edge_strength(mean_rgb)
+
+        structure = optical_edge
+        if cond is not None and cond.shape[1] == T:
+            sar = self._to_unit_range(cond)
+            sar_scalar = sar.mean(dim=2, keepdim=True)
+            sar_valid = torch.ones_like(sar_scalar[:, :, :1])
+            mean_sar = self._weighted_mean(sar_scalar, sar_valid)
+            sar_edge = self._edge_strength(mean_sar)
+            structure = torch.maximum(structure, sar_edge)
+
+        low_veg = self._sigmoid_score(0.30 - mean_ndvi, 0.0, 0.08)
+        low_change = self._sigmoid_score(0.08 - ndvi_change, 0.0, 0.035)
+        structured = self._sigmoid_score(structure, 0.08, 0.035)
+        built_score = low_veg * (0.4 + 0.6 * structured) * (0.5 + 0.5 * low_change)
+
+        vegetated = self._sigmoid_score(mean_ndvi, 0.25, 0.08)
+        seasonal = self._sigmoid_score(ndvi_change, 0.045, 0.025)
+        crop_score = vegetated * seasonal
+
+        high_veg = self._sigmoid_score(mean_ndvi, 0.38, 0.08)
+        stable_veg = self._sigmoid_score(0.065 - ndvi_change, 0.0, 0.03)
+        forest_score = high_veg * stable_veg
+
+        low_nir = self._sigmoid_score(0.18 - mean_nir, 0.0, 0.08)
+        water_or_shadow = low_nir * self._sigmoid_score(0.10 - mean_ndvi, 0.0, 0.08)
+        other_score = 0.20 + water_or_shadow
+
+        scores = torch.cat(
+            [built_score, crop_score, forest_score, other_score], dim=1
+        ).clamp_min(1e-4)
+        return scores / scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    def _mix_gate(self, probabilities, values):
+        gate_values = probabilities.new_tensor(values).view(1, 4, 1, 1)
+        gate = (probabilities * gate_values).sum(dim=1, keepdim=True)
+        return gate.clamp(self.min_gate, 1.0)
+
+    def forward(self, optical, cond=None, cloud_mask=None):
+        B, T, _, H, W = optical.shape
+        probabilities = self._class_probabilities(optical, cond=cond, cloud_mask=cloud_mask)
+
+        temporal_gate = self._mix_gate(probabilities, self.temporal_values)
+        sar_gate = self._mix_gate(probabilities, self.sar_values)
+        spatial_gate = self._mix_gate(probabilities, self.spatial_values)
+
+        return {
+            "landcover_probs": probabilities,
+            "building_prob": probabilities[:, 0:1].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "crop_prob": probabilities[:, 1:2].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "forest_prob": probabilities[:, 2:3].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "temporal_gate": temporal_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "sar_gate": sar_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "spatial_gate": spatial_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+        }
+
+
 class SDT(nn.Module):
     """
     Sequential Denoising Transformer.
@@ -658,6 +835,20 @@ class SDT(nn.Module):
             target_quality_residual_temperature=0.12,
             target_quality_temporal_scale_days=45.0,
             target_quality_sar_temperature=0.5,
+            landcover_router_enabled=False,
+            landcover_min_gate=0.25,
+            landcover_built_temporal_gate=0.35,
+            landcover_built_sar_gate=1.00,
+            landcover_built_spatial_gate=1.00,
+            landcover_crop_temporal_gate=1.00,
+            landcover_crop_sar_gate=0.60,
+            landcover_crop_spatial_gate=0.70,
+            landcover_forest_temporal_gate=0.65,
+            landcover_forest_sar_gate=0.50,
+            landcover_forest_spatial_gate=0.80,
+            landcover_other_temporal_gate=0.55,
+            landcover_other_sar_gate=0.70,
+            landcover_other_spatial_gate=0.65,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -669,6 +860,7 @@ class SDT(nn.Module):
         self.cloud_aware_attention = cloud_aware_attention
         self.use_cloud_mask_embedding = use_cloud_mask_embedding
         self.target_quality_refinement = target_quality_refinement
+        self.landcover_router_enabled = landcover_router_enabled
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.cond_embedder = PatchEmbed(input_size, patch_size, cond_in_channels, hidden_size, bias=True)
@@ -682,6 +874,21 @@ class SDT(nn.Module):
             temporal_scale_days=target_quality_temporal_scale_days,
             sar_temperature=target_quality_sar_temperature,
         ) if target_quality_refinement else None
+        self.landcover_router = LandCoverRouter(
+            min_gate=landcover_min_gate,
+            built_temporal_gate=landcover_built_temporal_gate,
+            built_sar_gate=landcover_built_sar_gate,
+            built_spatial_gate=landcover_built_spatial_gate,
+            crop_temporal_gate=landcover_crop_temporal_gate,
+            crop_sar_gate=landcover_crop_sar_gate,
+            crop_spatial_gate=landcover_crop_spatial_gate,
+            forest_temporal_gate=landcover_forest_temporal_gate,
+            forest_sar_gate=landcover_forest_sar_gate,
+            forest_spatial_gate=landcover_forest_spatial_gate,
+            other_temporal_gate=landcover_other_temporal_gate,
+            other_sar_gate=landcover_other_sar_gate,
+            other_spatial_gate=landcover_other_spatial_gate,
+        ) if landcover_router_enabled else None
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -785,6 +992,8 @@ class SDT(nn.Module):
             semantics=None,
             quality_target=None,
             quality_only=False,
+            landcover_source=None,
+            return_aux=False,
     ):
         """
         Forward pass of SDT.
@@ -804,6 +1013,23 @@ class SDT(nn.Module):
             raise ValueError("quality_only=True requires target quality refinement and quality_target.")
 
         B, T, C, H, W = x.shape
+        cloud_mask_sequence = cloud_mask
+        landcover_output = None
+        landcover_gates = None
+        if self.landcover_router is not None:
+            router_source = landcover_source if landcover_source is not None else x
+            landcover_output = self.landcover_router(
+                router_source, cond=cond, cloud_mask=cloud_mask_sequence
+            )
+            patch_size = self.x_embedder.patch_size[0]
+            landcover_gates = {}
+            for name in ("sar", "temporal", "spatial"):
+                gate = landcover_output[f"{name}_gate"].reshape(B * T, 1, H, W)
+                gate = F.avg_pool2d(
+                    gate, kernel_size=patch_size, stride=patch_size
+                ).flatten(1).clamp(0.0, 1.0)
+                landcover_gates[name] = gate
+
         # N = int(H * W / self.patch_size ** 2)
         x = x.contiguous().view(-1, C, H, W)
         x = self.x_embedder(x) + self.pos_embed  # ((B T), N, M), where N = H * W / patch_size ** 2
@@ -861,13 +1087,18 @@ class SDT(nn.Module):
 
         attn_cloud_mask = cloud_mask_tokens if self.cloud_aware_attention else None
         for block in self.blocks:
-            x = block(x, c, cond, attn_cloud_mask)
+            x = block(x, c, cond, attn_cloud_mask, landcover_gates)
 
 
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
 
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         x = x.view(B, T, x.shape[-3], x.shape[-2], x.shape[-1])
+        if return_aux:
+            output = {"prediction": x}
+            if landcover_output is not None:
+                output.update(landcover_output)
+            return output
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):

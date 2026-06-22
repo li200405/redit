@@ -27,6 +27,24 @@ SDT:
     patch_size: 8
     num_frames: 13
     cond_in_channels: 2
+    landcover_router_enabled: true
+    landcover_min_gate: 0.25
+    landcover_built_temporal_gate: 0.35
+    landcover_built_sar_gate: 1.00
+    landcover_built_spatial_gate: 1.00
+    landcover_crop_temporal_gate: 1.00
+    landcover_crop_sar_gate: 0.60
+    landcover_crop_spatial_gate: 0.70
+    landcover_forest_temporal_gate: 0.65
+    landcover_forest_sar_gate: 0.50
+    landcover_forest_spatial_gate: 0.80
+    landcover_other_temporal_gate: 0.55
+    landcover_other_sar_gate: 0.70
+    landcover_other_spatial_gate: 0.65
+
+landcover_loss:
+    enabled: true
+    building_edge_loss_w: 0.05
 
 training_settings:
     batch_size: 16

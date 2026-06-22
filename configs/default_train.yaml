@@ -45,11 +45,29 @@ SDT:                                   # See lib/models/SDT_own for a detailed d
     target_quality_residual_temperature: 0.12
     target_quality_temporal_scale_days: 45.0
     target_quality_sar_temperature: 0.5
+    landcover_router_enabled: false
+    landcover_min_gate: 0.25
+    landcover_built_temporal_gate: 0.35
+    landcover_built_sar_gate: 1.00
+    landcover_built_spatial_gate: 1.00
+    landcover_crop_temporal_gate: 1.00
+    landcover_crop_sar_gate: 0.60
+    landcover_crop_spatial_gate: 0.70
+    landcover_forest_temporal_gate: 0.65
+    landcover_forest_sar_gate: 0.50
+    landcover_forest_spatial_gate: 0.80
+    landcover_other_temporal_gate: 0.55
+    landcover_other_sar_gate: 0.70
+    landcover_other_spatial_gate: 0.65
 
 target_quality:
     enabled: true
     warmup_epochs: 100                # Gradually replace suspicious raw targets with temporal consensus.
     reliability_loss_w: 0.25          # Prevent the learned reliability map from collapsing.
+
+landcover_loss:
+    enabled: false
+    building_edge_loss_w: 0.05        # Extra Sobel edge loss over building-like masked pixels.
 
 training_settings:
     prediction_type: 'sample'              # Prediction type. ['epsilon', 'sample']

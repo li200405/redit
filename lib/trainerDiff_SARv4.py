@@ -87,6 +87,7 @@ class Trainer:
         self.compute_losses = TrainLoss(self.args.loss)
         self.loss_fn = F.mse_loss
         self.target_quality_args = self.args.get('target_quality', {})
+        self.landcover_loss_args = self.args.get('landcover_loss', {})
         # self.compute_metrics = EvalMetrics(self.args.metrics)
 
         # Losses: Initialize statistics
@@ -378,6 +379,47 @@ class Trainer:
 
 
 
+    @staticmethod
+    def _rgb_like_channels(frames: Tensor) -> Tensor:
+        if frames.shape[2] >= 3:
+            indices = torch.tensor([2, 1, 0], device=frames.device)
+            return frames.index_select(2, indices)
+        return frames
+
+    @staticmethod
+    def _sobel_edges(frames: Tensor) -> Tensor:
+        b, t, c, h, w = frames.shape
+        flat = frames.reshape(b * t, c, h, w)
+        kernel_x = flat.new_tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3) / 4.0
+        kernel_y = kernel_x.transpose(-1, -2)
+        kernel_x = kernel_x.repeat(c, 1, 1, 1)
+        kernel_y = kernel_y.repeat(c, 1, 1, 1)
+        grad_x = F.conv2d(flat, kernel_x, padding=1, groups=c)
+        grad_y = F.conv2d(flat, kernel_y, padding=1, groups=c)
+        return (grad_x.abs() + grad_y.abs()).reshape(b, t, c, h, w)
+
+    def _building_edge_loss(
+            self,
+            prediction: Tensor,
+            target: Tensor,
+            building_prob: Optional[Tensor],
+            loss_weight: Tensor,
+    ) -> Tensor:
+        if building_prob is None:
+            return prediction.new_tensor(0.0)
+
+        prediction_edges = self._sobel_edges(self._rgb_like_channels(prediction))
+        target_edges = self._sobel_edges(self._rgb_like_channels(target))
+        edge_weight = (loss_weight * building_prob.detach()).expand_as(prediction_edges)
+        edge_error = (prediction_edges - target_edges).abs()
+        return (
+            (edge_error * edge_weight).sum()
+            / edge_weight.sum().clamp_min(1.0)
+        )
+
+
     def inference_one_batch(
             self, batch: Dict[str, Any]
     ) -> Tensor:
@@ -438,9 +480,24 @@ class Trainer:
             quality_mask = torch.maximum(mask, cloud_mask)
 
         model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
-        pred_hat = self.model(
-            model_input, timesteps, date=date, cond=cond, cloud_mask=quality_mask
+        landcover_loss_enabled = bool(
+            self.landcover_loss_args.get('enabled', False)
         )
+        model_output = self.model(
+            model_input,
+            timesteps,
+            date=date,
+            cond=cond,
+            cloud_mask=quality_mask,
+            landcover_source=y_0,
+            return_aux=landcover_loss_enabled,
+        )
+        if isinstance(model_output, dict):
+            pred_hat = model_output['prediction']
+            building_prob = model_output.get('building_prob')
+        else:
+            pred_hat = model_output
+            building_prob = None
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
         if quality_output is not None:
@@ -453,7 +510,8 @@ class Trainer:
             supervision_confidence = (
                 reliability.detach() + (1.0 - reliability.detach()) * support
             )
-            valid_loss_mask = (mask * supervision_confidence).expand_as(y_0)
+            loss_weight = mask * supervision_confidence
+            valid_loss_mask = loss_weight.expand_as(y_0)
             reconstruction_error = (pred_hat - corrected_target).pow(2)
             reconstruction_loss = (
                 (reconstruction_error * valid_loss_mask).sum()
@@ -468,9 +526,21 @@ class Trainer:
                 self.target_quality_args.get('reliability_loss_w', 0.25)
             )
             loss = reconstruction_loss + reliability_loss_w * reliability_loss
+            edge_target = corrected_target
         else:
-            valid_loss_mask = (mask * (1. - cloud_mask)).expand_as(y_0)
+            loss_weight = mask * (1. - cloud_mask)
+            valid_loss_mask = loss_weight.expand_as(y_0)
             squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
             loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
+            edge_target = y_0
+
+        if landcover_loss_enabled and building_prob is not None:
+            edge_loss = self._building_edge_loss(
+                pred_hat, edge_target, building_prob, loss_weight
+            )
+            edge_loss_w = float(
+                self.landcover_loss_args.get('building_edge_loss_w', 0.05)
+            )
+            loss = loss + edge_loss_w * edge_loss
 
         return loss
