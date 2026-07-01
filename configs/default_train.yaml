@@ -9,6 +9,7 @@ data:                                      # See lib/datasets/EarthNet2021Datase
         type: random                       # Strategy for spatial cropping. ['random', 'center']
     pe_strategy: day-of-year               # Strategy for positional encoding. ['day-of-year', 'day-within-sequence', 'absolute', 'enumeration']
     max_seq_length: 15                     # Maximum temporal sequence length. Set to None to skip temporal trimming.
+    return_dense_sar: false                # True returns the full SAR sequence for dense SAR temporal memory.
 #    render_occluded_above_p: 0.9           # Minimum cloud cover [-] to fully mask an input image. Set to None to keep original cloud masks.
 #    return_cloud_mask: true                # Set to True if metrics/masked_metrics is True.
 
@@ -59,6 +60,12 @@ SDT:                                   # See lib/models/SDT_own for a detailed d
     landcover_other_temporal_gate: 0.55
     landcover_other_sar_gate: 0.70
     landcover_other_spatial_gate: 0.65
+    dense_sar_temporal_enabled: false      # Use full SAR sequence as temporal attention bias.
+    dense_sar_temporal_scale_days: 18.0    # Date kernel for aggregating dense SAR around each S2 date.
+    dense_sar_attention_date_scale_days: 45.0
+    dense_sar_topk: 9                      # Number of closest SAR frames used per S2 date; 0 uses all frames.
+    dense_sar_bias_gate_init: 0.15         # Initial strength for SAR-derived temporal attention bias.
+    dense_sar_cloud_bias_scale: 1.0
 
 target_quality:
     enabled: true

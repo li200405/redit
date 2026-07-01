@@ -432,6 +432,12 @@ class Trainer:
         date = batch['position_days'].cuda()            #  (B, T)           'position_days' or None
         # date = None
         cond = batch['cond'].cuda()            #  (B, T, 3, H, W)
+        cond_dense = batch.get('cond_dense')
+        cond_dense = cond_dense.cuda() if cond_dense is not None else None
+        date_cond_dense = batch.get('position_days_cond_dense')
+        date_cond_dense = date_cond_dense.cuda() if date_cond_dense is not None else None
+        date_dense_target = batch.get('position_days_s2_raw')
+        date_dense_target = date_dense_target.cuda() if date_dense_target is not None else date
         bs, length = y_0.shape[0], y_0.shape[1]
 
         if self.CTHW:
@@ -455,6 +461,9 @@ class Trainer:
                 timesteps,
                 date=date,
                 cond=cond,
+                cond_dense=cond_dense,
+                date_cond_dense=date_cond_dense,
+                date_dense_target=date_dense_target,
                 cloud_mask=cloud_mask,
                 quality_target=y_0,
                 quality_only=True,
@@ -488,6 +497,9 @@ class Trainer:
             timesteps,
             date=date,
             cond=cond,
+            cond_dense=cond_dense,
+            date_cond_dense=date_cond_dense,
+            date_dense_target=date_dense_target,
             cloud_mask=quality_mask,
             landcover_source=y_0,
             return_aux=landcover_loss_enabled,

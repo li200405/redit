@@ -384,6 +384,114 @@ class TemporalBlock(nn.Module):
 # out = block(x, c)
 # print(out.shape)
 
+
+class DenseSARTemporalMemory(nn.Module):
+    """
+    SAR-guided temporal modulation for S2 tokens.
+
+    The dense SAR branch only contributes attention bias. The value branch stays
+    in the S2 token space, which limits SAR-to-RGB spectral leakage.
+    """
+
+    def __init__(
+            self,
+            hidden_size,
+            num_heads,
+            num_frames=16,
+            date_scale_days=45.0,
+            sar_bias_gate_init=0.15,
+            cloud_bias_scale=1.0,
+            attn_drop=0.,
+            proj_drop=0.,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = hidden_size // num_heads
+        self.scale = head_dim ** -0.5
+        self.num_frames = num_frames
+        self.date_scale_days = date_scale_days
+        self.cloud_bias_scale = cloud_bias_scale
+
+        self.norm_x = nn.LayerNorm(hidden_size)
+        self.norm_sar = nn.LayerNorm(hidden_size)
+        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+        self.sar_q = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.sar_k = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        )
+
+        init = min(max(float(sar_bias_gate_init), 1e-4), 1.0 - 1e-4)
+        self.sar_bias_logit = nn.Parameter(
+            torch.tensor(math.log(init / (1.0 - init)), dtype=torch.float32)
+        )
+
+    def forward(
+            self,
+            x,
+            c,
+            dense_sar,
+            cloud_mask=None,
+            temporal_gate=None,
+            date_values=None,
+    ):
+        shift_mta, scale_mta, gate_mta = self.adaLN_modulation(c).chunk(3, dim=1)
+        T = self.num_frames
+        K, N, M = x.shape
+        B = K // T
+
+        x_ln = modulate(self.norm_x(x), shift_mta, scale_mta, self.num_frames)
+        x_ln = rearrange(x_ln, '(b t) n m -> (b n) t m', b=B, t=T, n=N, m=M)
+        sar_ln = self.norm_sar(dense_sar)
+        sar_ln = rearrange(sar_ln, '(b t) n m -> (b n) t m', b=B, t=T, n=N, m=M)
+
+        qkv = self.qkv(x_ln).reshape(B * N, T, 3, self.num_heads, M // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        sar_q = self.sar_q(sar_ln).reshape(B * N, T, self.num_heads, M // self.num_heads)
+        sar_k = self.sar_k(sar_ln).reshape(B * N, T, self.num_heads, M // self.num_heads)
+        sar_q = sar_q.permute(0, 2, 1, 3)
+        sar_k = sar_k.permute(0, 2, 1, 3)
+        sar_bias = (sar_q @ sar_k.transpose(-2, -1)) * self.scale
+        sar_bias = sar_bias - sar_bias.mean(dim=-1, keepdim=True)
+        attn = attn + torch.sigmoid(self.sar_bias_logit) * sar_bias
+
+        if date_values is not None:
+            date_distance = (
+                date_values[:, :, None].float() - date_values[:, None, :].float()
+            ).abs()
+            date_bias = -date_distance / max(float(self.date_scale_days), 1e-6)
+            date_bias = date_bias[:, None, None, :, :].expand(B, N, 1, T, T)
+            date_bias = date_bias.reshape(B * N, 1, T, T)
+            attn = attn + date_bias
+
+        if cloud_mask is not None:
+            cloud_mask_temporal = rearrange(cloud_mask, '(b t) n -> (b n) t', b=B, t=T, n=N)
+            clean_conf = (1.0 - cloud_mask_temporal.float()).clamp(1e-4, 1.0)
+            key_bias = self.cloud_bias_scale * torch.log(clean_conf)
+            attn = attn + key_bias[:, None, None, :]
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        res_temporal = (attn @ v).transpose(1, 2).reshape(B * N, T, M)
+        res_temporal = self.proj(res_temporal)
+        res_temporal = self.proj_drop(res_temporal)
+
+        res_temporal = rearrange(res_temporal, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
+        res_temporal = gate_mta.unsqueeze(1) * res_temporal
+        res_temporal = rearrange(res_temporal, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if temporal_gate is not None:
+            res_temporal = res_temporal * temporal_gate.unsqueeze(-1)
+
+        return x + res_temporal
+
+
 class SpatialBlock(nn.Module):
     """
     A SpatialBlock with adaptive layer norm zero (adaLN-Zero) conditioning.
@@ -428,9 +536,32 @@ class ConditionTS_Block(nn.Module):
     3. A SpatialBlock.
     4. A Feed Forward Network (MLP).
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, num_frames=16, if_cross_attention=True,**block_kwargs):
+    def __init__(
+            self,
+            hidden_size,
+            num_heads,
+            mlp_ratio=4.0,
+            num_frames=16,
+            if_cross_attention=True,
+            dense_sar_temporal_enabled=False,
+            dense_sar_attention_date_scale_days=45.0,
+            dense_sar_bias_gate_init=0.15,
+            dense_sar_cloud_bias_scale=1.0,
+            **block_kwargs,
+    ):
         super().__init__()
         self.CrossAttentionBlock = CrossAttentionBlock(hidden_size, num_heads, num_frames=num_frames)
+        self.DenseSARTemporalMemory = (
+            DenseSARTemporalMemory(
+                hidden_size,
+                num_heads,
+                num_frames=num_frames,
+                date_scale_days=dense_sar_attention_date_scale_days,
+                sar_bias_gate_init=dense_sar_bias_gate_init,
+                cloud_bias_scale=dense_sar_cloud_bias_scale,
+            )
+            if dense_sar_temporal_enabled else None
+        )
         self.TemporalBlock = TemporalBlock(hidden_size, num_heads, num_frames=num_frames)
         self.SpatialBlock = SpatialBlock(hidden_size, num_heads, num_frames=num_frames)
 
@@ -444,7 +575,16 @@ class ConditionTS_Block(nn.Module):
         )
         self.num_frames = num_frames
         self.ifCrossAttention = if_cross_attention
-    def forward(self, x, c, SAR, cloud_mask=None, landcover_gates=None):
+    def forward(
+            self,
+            x,
+            c,
+            SAR,
+            cloud_mask=None,
+            landcover_gates=None,
+            dense_sar=None,
+            date_values=None,
+    ):
 
         T = self.num_frames
         K, N, M = x.shape
@@ -460,6 +600,15 @@ class ConditionTS_Block(nn.Module):
 
         if self.ifCrossAttention:
             x = self.CrossAttentionBlock(x, c, SAR, sar_gate=sar_gate)
+        if self.DenseSARTemporalMemory is not None and dense_sar is not None:
+            x = self.DenseSARTemporalMemory(
+                x,
+                c,
+                dense_sar,
+                cloud_mask=cloud_mask,
+                temporal_gate=temporal_gate,
+                date_values=date_values,
+            )
         x = self.TemporalBlock(x, c, cloud_mask, temporal_gate=temporal_gate)
         x = self.SpatialBlock(x, c, cloud_mask, spatial_gate=spatial_gate)
 
@@ -849,6 +998,12 @@ class SDT(nn.Module):
             landcover_other_temporal_gate=0.55,
             landcover_other_sar_gate=0.70,
             landcover_other_spatial_gate=0.65,
+            dense_sar_temporal_enabled=False,
+            dense_sar_temporal_scale_days=18.0,
+            dense_sar_attention_date_scale_days=45.0,
+            dense_sar_topk=9,
+            dense_sar_bias_gate_init=0.15,
+            dense_sar_cloud_bias_scale=1.0,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -861,6 +1016,9 @@ class SDT(nn.Module):
         self.use_cloud_mask_embedding = use_cloud_mask_embedding
         self.target_quality_refinement = target_quality_refinement
         self.landcover_router_enabled = landcover_router_enabled
+        self.dense_sar_temporal_enabled = dense_sar_temporal_enabled
+        self.dense_sar_temporal_scale_days = dense_sar_temporal_scale_days
+        self.dense_sar_topk = int(dense_sar_topk) if dense_sar_topk is not None else 0
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.cond_embedder = PatchEmbed(input_size, patch_size, cond_in_channels, hidden_size, bias=True)
@@ -900,7 +1058,17 @@ class SDT(nn.Module):
 
 
         self.blocks = nn.ModuleList(
-            ConditionTS_Block(hidden_size, num_heads, mlp_ratio=mlp_ratio, num_frames=self.num_frames, if_cross_attention=self.cross_attention)
+            ConditionTS_Block(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                num_frames=self.num_frames,
+                if_cross_attention=self.cross_attention,
+                dense_sar_temporal_enabled=self.dense_sar_temporal_enabled,
+                dense_sar_attention_date_scale_days=dense_sar_attention_date_scale_days,
+                dense_sar_bias_gate_init=dense_sar_bias_gate_init,
+                dense_sar_cloud_bias_scale=dense_sar_cloud_bias_scale,
+            )
             for _ in range(depth)
         )
 
@@ -951,6 +1119,10 @@ class SDT(nn.Module):
                 nn.init.constant_(TSblock.CrossAttentionBlock.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(TSblock.CrossAttentionBlock.adaLN_modulation[-1].bias, 0)
 
+            if TSblock.DenseSARTemporalMemory is not None:
+                nn.init.constant_(TSblock.DenseSARTemporalMemory.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(TSblock.DenseSARTemporalMemory.adaLN_modulation[-1].bias, 0)
+
             nn.init.constant_(TSblock.TemporalBlock.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(TSblock.TemporalBlock.adaLN_modulation[-1].bias, 0)
 
@@ -981,12 +1153,56 @@ class SDT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    def _prepare_dense_dates(self, target_dates, source_dates, batch_size, target_length, source_length, device):
+        if target_dates is None:
+            target_dates = torch.arange(target_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            target_dates = target_dates.to(device)
+            if target_dates.dim() == 1:
+                target_dates = target_dates.unsqueeze(0).expand(batch_size, -1)
+
+        if source_dates is None:
+            source_dates = torch.arange(source_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            source_dates = source_dates.to(device)
+            if source_dates.dim() == 1:
+                source_dates = source_dates.unsqueeze(0).expand(batch_size, -1)
+
+        return target_dates, source_dates
+
+    def _aggregate_dense_sar(self, cond_dense, target_dates=None, source_dates=None):
+        B, source_length, C, H, W = cond_dense.shape
+        target_dates, source_dates = self._prepare_dense_dates(
+            target_dates,
+            source_dates,
+            B,
+            self.num_frames,
+            source_length,
+            cond_dense.device,
+        )
+        date_distance = (
+            target_dates[:, :, None].float() - source_dates[:, None, :].float()
+        ).abs()
+        logits = -date_distance / max(float(self.dense_sar_temporal_scale_days), 1e-6)
+
+        if 0 < self.dense_sar_topk < source_length:
+            topk_indices = logits.topk(self.dense_sar_topk, dim=-1).indices
+            topk_mask = torch.zeros_like(logits, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_indices, True)
+            logits = logits.masked_fill(~topk_mask, torch.finfo(logits.dtype).min)
+
+        weights = logits.softmax(dim=-1).to(cond_dense.dtype)
+        return torch.einsum('btd,bdchw->btchw', weights, cond_dense)
+
     def forward(
             self,
             x,
             t,
             date=None,
             cond=None,
+            cond_dense=None,
+            date_cond_dense=None,
+            date_dense_target=None,
             cloud_mask=None,
             location=None,
             semantics=None,
@@ -1001,6 +1217,7 @@ class SDT(nn.Module):
         t: (B,) tensor of diffusion timesteps
         date: (B, T) tensor of dates
         cond: same with x, conditional inputs such as SAR images
+        cond_dense: denser SAR sequence, e.g. (B, 46, C_sar, H, W)
         """
 
         if quality_target is not None and self.target_quality_refiner is not None:
@@ -1054,11 +1271,14 @@ class SDT(nn.Module):
         #     y = self.y_embedder(y, self.training)  # (B, M)
         #     c = t + y  # (B, M)
 
+        date_values = date
+        date_tokens = None
+
         # date embedding:
         if date is not None:
-            date = self.date_embedder(date)
-            date = rearrange(date, 'b t m -> (b t) 1 m', b=B, t=T)
-            x = x + date
+            date_tokens = self.date_embedder(date)
+            date_tokens = rearrange(date_tokens, 'b t m -> (b t) 1 m', b=B, t=T)
+            x = x + date_tokens
         else:
             # if dates are not provided
             x = rearrange(x, '(b t) n m -> (b n) t m', b=B, t=T)
@@ -1076,18 +1296,56 @@ class SDT(nn.Module):
             cond = cond.contiguous().view(-1, self.cond_in_channels, H, W)
             cond = self.cond_embedder(cond) + self.pos_embed  # ((B T), N, M), where N = H * W / patch_size ** 2
 
-            if date is not None:
-                cond = cond + date
+            if date_tokens is not None:
+                cond = cond + date_tokens
             else:
                 cond = rearrange(cond, '(b t) n m -> (b n) t m', b=B, t=T)
                 cond = cond + self.time_embed
                 cond = self.time_drop(cond)
                 cond = rearrange(cond, '(b n) t m -> (b t) n m', b=B, t=T)
 
+        dense_sar_tokens = None
+        dense_sar_dates = date_dense_target if date_dense_target is not None else date_values
+        if self.dense_sar_temporal_enabled and cond_dense is not None:
+            if dense_sar_dates is not None:
+                dense_sar_dates = dense_sar_dates.to(cond_dense.device)
+                if dense_sar_dates.dim() == 1:
+                    dense_sar_dates = dense_sar_dates.unsqueeze(0).expand(B, -1)
+            dense_sar_memory = self._aggregate_dense_sar(
+                cond_dense,
+                target_dates=dense_sar_dates,
+                source_dates=date_cond_dense,
+            )
+            dense_sar_tokens = dense_sar_memory.contiguous().view(-1, self.cond_in_channels, H, W)
+            dense_sar_tokens = self.cond_embedder(dense_sar_tokens) + self.pos_embed
+
+            if dense_sar_dates is not None:
+                dense_date_tokens = self.date_embedder(dense_sar_dates)
+                dense_date_tokens = rearrange(
+                    dense_date_tokens, 'b t m -> (b t) 1 m', b=B, t=T
+                )
+                dense_sar_tokens = dense_sar_tokens + dense_date_tokens
+            else:
+                dense_sar_tokens = rearrange(
+                    dense_sar_tokens, '(b t) n m -> (b n) t m', b=B, t=T
+                )
+                dense_sar_tokens = dense_sar_tokens + self.time_embed
+                dense_sar_tokens = self.time_drop(dense_sar_tokens)
+                dense_sar_tokens = rearrange(
+                    dense_sar_tokens, '(b n) t m -> (b t) n m', b=B, t=T
+                )
 
         attn_cloud_mask = cloud_mask_tokens if self.cloud_aware_attention else None
         for block in self.blocks:
-            x = block(x, c, cond, attn_cloud_mask, landcover_gates)
+            x = block(
+                x,
+                c,
+                cond,
+                attn_cloud_mask,
+                landcover_gates,
+                dense_sar=dense_sar_tokens,
+                date_values=dense_sar_dates,
+            )
 
 
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)

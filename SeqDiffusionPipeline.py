@@ -22,6 +22,9 @@ class SeqDiffusionPipeline(DiffusionPipeline):
             mask: PipelineImageInput = None,   # [B, T, 1 ,H, W]
             batch_positions: Optional[torch.Tensor] = None,
             cond: Optional[torch.Tensor] = None,
+            cond_dense: Optional[torch.Tensor] = None,
+            date_cond_dense: Optional[torch.Tensor] = None,
+            date_dense_target: Optional[torch.Tensor] = None,
             generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
             eta: float = 0.0,
             num_inference_steps: int = 1,
@@ -46,24 +49,19 @@ class SeqDiffusionPipeline(DiffusionPipeline):
 
             with torch.no_grad():
                 model_cloud_mask = quality_mask if quality_mask is not None else mask
-                if cond is not None and batch_positions is not None:
-                    model_output = self.model(
-                        unet_input, t, batch_positions, cond,
-                        cloud_mask=model_cloud_mask,
-                        landcover_source=image,
-                    )
-                elif cond is not None and batch_positions is None:
-                    model_output = self.model(
-                        unet_input, t, date=None, cond=cond,
-                        cloud_mask=model_cloud_mask,
-                        landcover_source=image,
-                    )
-                else:
-                    model_output = self.model(
-                        unet_input, t,
-                        cloud_mask=model_cloud_mask,
-                        landcover_source=image,
-                    )
+                model_kwargs = {
+                    "date": batch_positions,
+                    "cond": cond,
+                    "cloud_mask": model_cloud_mask,
+                    "landcover_source": image,
+                }
+                if cond_dense is not None:
+                    model_kwargs["cond_dense"] = cond_dense
+                if date_cond_dense is not None:
+                    model_kwargs["date_cond_dense"] = date_cond_dense
+                if date_dense_target is not None:
+                    model_kwargs["date_dense_target"] = date_dense_target
+                model_output = self.model(unet_input, t, **model_kwargs)
             # 2. predict previous mean of image x_t-1 and add variance depending on eta
             # eta corresponds to η in paper and should be between [0, 1]
             # do x_t -> x_t-1

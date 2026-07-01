@@ -18,6 +18,7 @@ data:
     dates_file: dates.json
     cloudy_indices_file: low_clear_T_S2_CLEAR.json
     date_rescale: true
+    return_dense_sar: true
     train_ratio: 0.9
     seed: 0
 
@@ -41,6 +42,12 @@ SDT:
     landcover_other_temporal_gate: 0.55
     landcover_other_sar_gate: 0.70
     landcover_other_spatial_gate: 0.65
+    dense_sar_temporal_enabled: true
+    dense_sar_temporal_scale_days: 18.0
+    dense_sar_attention_date_scale_days: 45.0
+    dense_sar_topk: 9
+    dense_sar_bias_gate_init: 0.15
+    dense_sar_cloud_bias_scale: 1.0
 
 landcover_loss:
     enabled: true

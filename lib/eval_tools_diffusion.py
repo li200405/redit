@@ -169,14 +169,20 @@ def impute_sequence_SDT(
     if ifCond:
         x = batch['x']
         cond = batch['cond']
+        cond_dense = batch.get('cond_dense')
+        date_cond_dense = batch.get('position_days_cond_dense')
     else:
         x = batch['x']
         cond = None
+        cond_dense = None
+        date_cond_dense = None
 
     if ifDate:
         date = batch['position_days']
+        date_dense_target = batch.get('position_days_s2_raw', date)
     else:
         date = None
+        date_dense_target = None
 
     mask = batch['masks']
     quality_mask = torch.maximum(mask, batch.get('cloud_mask', torch.zeros_like(mask)))
@@ -196,6 +202,12 @@ def impute_sequence_SDT(
         if date is not None:
             pad = torch.zeros((date.shape[0], temporal_window - date.shape[1]), device=date.device)
             date = torch.cat([date, pad], dim=1)
+        if date_dense_target is not None:
+            pad = torch.zeros(
+                (date_dense_target.shape[0], temporal_window - date_dense_target.shape[1]),
+                device=date_dense_target.device,
+            )
+            date_dense_target = torch.cat([date_dense_target, pad], dim=1)
         if cond is not None:
             pad = torch.zeros(
                 (cond.shape[0], temporal_window - cond.shape[1], cond.shape[2], cond.shape[3], cond.shape[4]),
@@ -204,7 +216,10 @@ def impute_sequence_SDT(
             cond = torch.cat([cond, pad], dim=1)
         y_pred = pipeline(
             x, mask, date, cond, generator=generator, num_inference_steps=num_inference_steps,
-            quality_mask=quality_mask
+            quality_mask=quality_mask,
+            cond_dense=cond_dense,
+            date_cond_dense=date_cond_dense,
+            date_dense_target=date_dense_target,
         )
         y_pred = y_pred[:, :seq_length]
 
@@ -213,7 +228,10 @@ def impute_sequence_SDT(
         # y_pred = model(x, batch_positions=positions)
         y_pred = pipeline(
             x, mask, date, cond, generator=generator, num_inference_steps=num_inference_steps,
-            quality_mask=quality_mask
+            quality_mask=quality_mask,
+            cond_dense=cond_dense,
+            date_cond_dense=date_cond_dense,
+            date_dense_target=date_dense_target,
         )
 
     else:
@@ -230,14 +248,22 @@ def impute_sequence_SDT(
                     x[:, t_start:t_end], mask[:, t_start:t_end],
                     date[:, t_start:t_end], cond[:, t_start:t_end],
                     generator=generator, num_inference_steps=num_inference_steps,
-                    quality_mask=quality_mask[:, t_start:t_end]
+                    quality_mask=quality_mask[:, t_start:t_end],
+                    cond_dense=cond_dense,
+                    date_cond_dense=date_cond_dense,
+                    date_dense_target=(
+                        date_dense_target[:, t_start:t_end]
+                        if date_dense_target is not None else None
+                    ),
                 )
             else:
                 y_pred_chunk = pipeline(
                     x[:, t_start:t_end], mask[:, t_start:t_end], batch_positions=None,
                     cond=cond[:, t_start:t_end], generator=generator,
                     num_inference_steps=num_inference_steps,
-                    quality_mask=quality_mask[:, t_start:t_end]
+                    quality_mask=quality_mask[:, t_start:t_end],
+                    cond_dense=cond_dense,
+                    date_cond_dense=date_cond_dense,
                 )
 
 
@@ -356,5 +382,3 @@ def move_temporal_window_next(
                 t_start, t_end = move_temporal_window_end(t_max, temporal_window)
 
     return t_start, t_end
-
-
