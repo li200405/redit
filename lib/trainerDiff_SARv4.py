@@ -87,9 +87,6 @@ class Trainer:
         self.compute_losses = TrainLoss(self.args.loss)
         self.loss_fn = F.mse_loss
         self.target_quality_args = self.args.get('target_quality', {})
-        self.temporal_stability_args = self.args.get(
-            'temporal_stability', {}
-        )
         # self.compute_metrics = EvalMetrics(self.args.metrics)
 
         # Losses: Initialize statistics
@@ -441,36 +438,9 @@ class Trainer:
             quality_mask = torch.maximum(mask, cloud_mask)
 
         model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
-        stability_enabled = self.temporal_stability_args.get(
-            'enabled', False
+        pred_hat = self.model(
+            model_input, timesteps, date=date, cond=cond, cloud_mask=quality_mask
         )
-        model_output = self.model(
-            model_input,
-            timesteps,
-            date=date,
-            cond=cond,
-            cloud_mask=quality_mask,
-            stability_source=model_input,
-            return_aux=stability_enabled,
-        )
-        if isinstance(model_output, dict):
-            pred_hat = model_output['prediction']
-            temporal_focus = model_output.get('dynamic_focus')
-        else:
-            pred_hat = model_output
-            temporal_focus = None
-
-        if temporal_focus is not None:
-            stability_loss_floor = float(
-                self.temporal_stability_args.get('loss_floor', 0.25)
-            )
-            temporal_loss_weight = (
-                stability_loss_floor
-                + (1.0 - stability_loss_floor)
-                * temporal_focus.detach()
-            )
-        else:
-            temporal_loss_weight = 1.0
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
         if quality_output is not None:
@@ -483,9 +453,7 @@ class Trainer:
             supervision_confidence = (
                 reliability.detach() + (1.0 - reliability.detach()) * support
             )
-            valid_loss_mask = (
-                mask * supervision_confidence * temporal_loss_weight
-            ).expand_as(y_0)
+            valid_loss_mask = (mask * supervision_confidence).expand_as(y_0)
             reconstruction_error = (pred_hat - corrected_target).pow(2)
             reconstruction_loss = (
                 (reconstruction_error * valid_loss_mask).sum()
@@ -501,9 +469,7 @@ class Trainer:
             )
             loss = reconstruction_loss + reliability_loss_w * reliability_loss
         else:
-            valid_loss_mask = (
-                mask * (1. - cloud_mask) * temporal_loss_weight
-            ).expand_as(y_0)
+            valid_loss_mask = (mask * (1. - cloud_mask)).expand_as(y_0)
             squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
             loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
 
