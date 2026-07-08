@@ -27,12 +27,12 @@ from lib.models.SDT import SDT
 # ============================== USER SETTINGS ==============================
 
 # Use the config.yaml saved in the same experiment directory as the checkpoint.
-CONFIG_PATH = r"D:\dpmm\REDiT\results\2026-06-22_15-29"
-CHECKPOINT_PATH = r"D:\dpmm\REDiT\results\2026-06-22_15-29\checkpoints\Model_after_850_epochs.pth"
+CONFIG_PATH = r"D:\dpmm\REDiT\results\2026-07-01_17-59"
+CHECKPOINT_PATH = r"D:\dpmm\REDiT\results\2026-07-01_17-59\checkpoints\Model_after_2700_epochs.pth"
 
 # Dataset root and the single S2 file to reconstruct.
 DATA_ROOT = r"D:\dpmm\DATA\chongqin"
-S2_PATH = r"D:\dpmm\DATA\chongqin\DATA_S2\S2_004857.npy"
+S2_PATH = r"D:\dpmm\DATA\chongqin\DATA_S2\S2_005104.npy"
 
 # Leave these as None to find the matching files automatically from S2_PATH.
 S1_PATH = None
@@ -40,7 +40,7 @@ MASK_PATH = None
 DATES_PATH = None
 
 # Output settings.
-OUTPUT_PATH = r"results/reconstruction/S2_004857_reconstructed_lcr.npy"
+OUTPUT_PATH = r"results/reconstruction/S2_005104_reconstructed_时间异步融合.npy"
 SAVE_PREDICTION_ONLY_PATH = None
 
 # Diffusion/sliding-window settings.
