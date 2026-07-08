@@ -18,7 +18,6 @@ data:
     dates_file: dates.json
     cloudy_indices_file: low_clear_T_S2_CLEAR.json
     date_rescale: true
-    return_dense_sar: true
     train_ratio: 0.9
     seed: 0
 
@@ -28,30 +27,17 @@ SDT:
     patch_size: 8
     num_frames: 13
     cond_in_channels: 2
-    landcover_router_enabled: true
-    landcover_min_gate: 0.25
-    landcover_built_temporal_gate: 0.35
-    landcover_built_sar_gate: 1.00
-    landcover_built_spatial_gate: 1.00
-    landcover_crop_temporal_gate: 1.00
-    landcover_crop_sar_gate: 0.60
-    landcover_crop_spatial_gate: 0.70
-    landcover_forest_temporal_gate: 0.65
-    landcover_forest_sar_gate: 0.50
-    landcover_forest_spatial_gate: 0.80
-    landcover_other_temporal_gate: 0.55
-    landcover_other_sar_gate: 0.70
-    landcover_other_spatial_gate: 0.65
-    dense_sar_temporal_enabled: true
-    dense_sar_temporal_scale_days: 18.0
-    dense_sar_attention_date_scale_days: 45.0
-    dense_sar_topk: 9
-    dense_sar_bias_gate_init: 0.15
-    dense_sar_cloud_bias_scale: 1.0
+    temporal_stability_suppression: true
+    stability_optical_threshold: 0.04
+    stability_sar_threshold: 0.10
+    stability_optical_temperature: 0.02
+    stability_sar_temperature: 0.04
+    stability_spatial_kernel: 5
+    stability_attention_floor: 0.25
 
-landcover_loss:
+temporal_stability:
     enabled: true
-    building_edge_loss_w: 0.05
+    loss_floor: 0.25
 
 training_settings:
     batch_size: 16

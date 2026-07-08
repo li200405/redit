@@ -31,7 +31,6 @@ class ChongqingDataset(tdata.Dataset):
         seed: int = 0,
         dates_file: str = "dates.json",
         cloudy_indices_file: str = "low_clear_T_S2_CLEAR.json",
-        return_dense_sar: bool = False,
         mask_kwargs: Optional[DictConfig] = None,
         augment: bool = False,
         **kwargs,
@@ -48,7 +47,6 @@ class ChongqingDataset(tdata.Dataset):
         self.ifCTHW = ifCTHW
         self.date_rescale = date_rescale
         self.augment = augment
-        self.return_dense_sar = return_dense_sar
 
         self.s2_dir = os.path.join(self.root, "DATA_S2")
         self.s1_dir = os.path.join(self.root, "DATA_S1A")
@@ -221,14 +219,13 @@ class ChongqingDataset(tdata.Dataset):
             position_days = ((position_days / 10).round() * 10).int()
         days = selected_s2_dates - selected_s2_dates[0]
 
-        sample = {
+        return {
             "x": frames_input,
             "cond": cond,
             "y": s2,
             "masks": masks,
             "position_days": position_days,
             "position_days_cond": selected_s1_dates,
-            "position_days_s2_raw": selected_s2_dates,
             "days": days,
             "sample_index": sample_id,
             "label": torch.tensor(0, dtype=torch.long),
@@ -236,10 +233,6 @@ class ChongqingDataset(tdata.Dataset):
             "c_index_nir": self.c_index_nir,
             "cloud_mask": target_cloud_mask,
         }
-        if self.return_dense_sar:
-            sample["cond_dense"] = s1
-            sample["position_days_cond_dense"] = self.s1_dates.clone()
-        return sample
 
     def _select_target_indices(self, clear_indices):
         if self.max_seq_length is None or clear_indices.numel() <= self.max_seq_length:

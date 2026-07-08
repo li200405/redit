@@ -87,7 +87,9 @@ class Trainer:
         self.compute_losses = TrainLoss(self.args.loss)
         self.loss_fn = F.mse_loss
         self.target_quality_args = self.args.get('target_quality', {})
-        self.landcover_loss_args = self.args.get('landcover_loss', {})
+        self.temporal_stability_args = self.args.get(
+            'temporal_stability', {}
+        )
         # self.compute_metrics = EvalMetrics(self.args.metrics)
 
         # Losses: Initialize statistics
@@ -379,47 +381,6 @@ class Trainer:
 
 
 
-    @staticmethod
-    def _rgb_like_channels(frames: Tensor) -> Tensor:
-        if frames.shape[2] >= 3:
-            indices = torch.tensor([2, 1, 0], device=frames.device)
-            return frames.index_select(2, indices)
-        return frames
-
-    @staticmethod
-    def _sobel_edges(frames: Tensor) -> Tensor:
-        b, t, c, h, w = frames.shape
-        flat = frames.reshape(b * t, c, h, w)
-        kernel_x = flat.new_tensor(
-            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
-        ).view(1, 1, 3, 3) / 4.0
-        kernel_y = kernel_x.transpose(-1, -2)
-        kernel_x = kernel_x.repeat(c, 1, 1, 1)
-        kernel_y = kernel_y.repeat(c, 1, 1, 1)
-        grad_x = F.conv2d(flat, kernel_x, padding=1, groups=c)
-        grad_y = F.conv2d(flat, kernel_y, padding=1, groups=c)
-        return (grad_x.abs() + grad_y.abs()).reshape(b, t, c, h, w)
-
-    def _building_edge_loss(
-            self,
-            prediction: Tensor,
-            target: Tensor,
-            building_prob: Optional[Tensor],
-            loss_weight: Tensor,
-    ) -> Tensor:
-        if building_prob is None:
-            return prediction.new_tensor(0.0)
-
-        prediction_edges = self._sobel_edges(self._rgb_like_channels(prediction))
-        target_edges = self._sobel_edges(self._rgb_like_channels(target))
-        edge_weight = (loss_weight * building_prob.detach()).expand_as(prediction_edges)
-        edge_error = (prediction_edges - target_edges).abs()
-        return (
-            (edge_error * edge_weight).sum()
-            / edge_weight.sum().clamp_min(1.0)
-        )
-
-
     def inference_one_batch(
             self, batch: Dict[str, Any]
     ) -> Tensor:
@@ -432,12 +393,6 @@ class Trainer:
         date = batch['position_days'].cuda()            #  (B, T)           'position_days' or None
         # date = None
         cond = batch['cond'].cuda()            #  (B, T, 3, H, W)
-        cond_dense = batch.get('cond_dense')
-        cond_dense = cond_dense.cuda() if cond_dense is not None else None
-        date_cond_dense = batch.get('position_days_cond_dense')
-        date_cond_dense = date_cond_dense.cuda() if date_cond_dense is not None else None
-        date_dense_target = batch.get('position_days_s2_raw')
-        date_dense_target = date_dense_target.cuda() if date_dense_target is not None else date
         bs, length = y_0.shape[0], y_0.shape[1]
 
         if self.CTHW:
@@ -461,9 +416,6 @@ class Trainer:
                 timesteps,
                 date=date,
                 cond=cond,
-                cond_dense=cond_dense,
-                date_cond_dense=date_cond_dense,
-                date_dense_target=date_dense_target,
                 cloud_mask=cloud_mask,
                 quality_target=y_0,
                 quality_only=True,
@@ -489,27 +441,36 @@ class Trainer:
             quality_mask = torch.maximum(mask, cloud_mask)
 
         model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
-        landcover_loss_enabled = bool(
-            self.landcover_loss_args.get('enabled', False)
+        stability_enabled = self.temporal_stability_args.get(
+            'enabled', False
         )
         model_output = self.model(
             model_input,
             timesteps,
             date=date,
             cond=cond,
-            cond_dense=cond_dense,
-            date_cond_dense=date_cond_dense,
-            date_dense_target=date_dense_target,
             cloud_mask=quality_mask,
-            landcover_source=y_0,
-            return_aux=landcover_loss_enabled,
+            stability_source=model_input,
+            return_aux=stability_enabled,
         )
         if isinstance(model_output, dict):
             pred_hat = model_output['prediction']
-            building_prob = model_output.get('building_prob')
+            temporal_focus = model_output.get('dynamic_focus')
         else:
             pred_hat = model_output
-            building_prob = None
+            temporal_focus = None
+
+        if temporal_focus is not None:
+            stability_loss_floor = float(
+                self.temporal_stability_args.get('loss_floor', 0.25)
+            )
+            temporal_loss_weight = (
+                stability_loss_floor
+                + (1.0 - stability_loss_floor)
+                * temporal_focus.detach()
+            )
+        else:
+            temporal_loss_weight = 1.0
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
         if quality_output is not None:
@@ -522,8 +483,9 @@ class Trainer:
             supervision_confidence = (
                 reliability.detach() + (1.0 - reliability.detach()) * support
             )
-            loss_weight = mask * supervision_confidence
-            valid_loss_mask = loss_weight.expand_as(y_0)
+            valid_loss_mask = (
+                mask * supervision_confidence * temporal_loss_weight
+            ).expand_as(y_0)
             reconstruction_error = (pred_hat - corrected_target).pow(2)
             reconstruction_loss = (
                 (reconstruction_error * valid_loss_mask).sum()
@@ -538,21 +500,11 @@ class Trainer:
                 self.target_quality_args.get('reliability_loss_w', 0.25)
             )
             loss = reconstruction_loss + reliability_loss_w * reliability_loss
-            edge_target = corrected_target
         else:
-            loss_weight = mask * (1. - cloud_mask)
-            valid_loss_mask = loss_weight.expand_as(y_0)
+            valid_loss_mask = (
+                mask * (1. - cloud_mask) * temporal_loss_weight
+            ).expand_as(y_0)
             squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
             loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
-            edge_target = y_0
-
-        if landcover_loss_enabled and building_prob is not None:
-            edge_loss = self._building_edge_loss(
-                pred_hat, edge_target, building_prob, loss_weight
-            )
-            edge_loss_w = float(
-                self.landcover_loss_args.get('building_edge_loss_w', 0.05)
-            )
-            loss = loss + edge_loss_w * edge_loss
 
         return loss
