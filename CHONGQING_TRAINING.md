@@ -82,3 +82,40 @@ The script reconstructs the complete 30-frame sequence with overlapping
 switching strategy as the original reconstruction script instead of being
 averaged. By default, only masked pixels are replaced and clear pixels retain
 their original S2 values.
+
+## VMamba restoration backbone
+
+The SDT model now uses one fixed restoration backbone; there is no legacy
+Transformer/VMamba runtime switch. The backbone contains:
+
+1. `4 x 4` S2 and S1 patch embedding.
+2. S1/S2 cross-modal attention for aligned SAR conditioning.
+3. Date-aware bidirectional temporal Mamba over every spatial token.
+4. Four-direction, multi-scale visual selective scans over every S2 frame.
+5. A pixel-space high-frequency residual head for roads and boundaries.
+
+The full dense S1 sequence is date-weighted for every S2 target date. It only
+guides temporal state updates; the optical value stream remains in S2 feature
+space.
+
+This architecture requires newly trained weights. Checkpoints created by the
+older Transformer backbone are not shape-compatible with this version.
+
+## Training loss log
+
+Every `Train:` line in `training.log` reports the actual weighted loss
+contributions:
+
+```text
+reconstruction_loss
+reliability_loss
+building_edge_loss
+spatial_gradient_loss
+spectral_angle_loss
+temporal_difference_loss
+total_loss
+```
+
+The component values add up to `total_loss`. Model-best selection also uses
+`total_loss`; it is no longer stored under the misleading
+`l1_loss_occluded_input_pixels` label.

@@ -1,8 +1,7 @@
 import logging
-from dataclasses import dataclass
 import time
 import torch
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from typing import Any, Dict, Optional, Tuple
 from torch import Tensor
 from PIL import Image
@@ -14,8 +13,6 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from lib import logger, visutils
 from lib.logger import AverageMeter
-from lib.loss import TrainLoss
-from lib.data_utils import to_device
 import wandb
 
 from tqdm.auto import tqdm
@@ -84,9 +81,9 @@ class Trainer:
         self.model.to(self.device)
         self.args.accum_iter = self.args.get('accum_iter', 1)  # accumulate gradients for `accum_iter` iterations
 
-        self.compute_losses = TrainLoss(self.args.loss)
-        self.loss_fn = F.mse_loss
         self.target_quality_args = self.args.get('target_quality', {})
+        self.landcover_loss_args = self.args.get('landcover_loss', {})
+        self.restoration_loss_args = self.args.get('restoration_loss', {})
         # self.compute_metrics = EvalMetrics(self.args.metrics)
 
         # Losses: Initialize statistics
@@ -210,11 +207,16 @@ class Trainer:
                         stats[key] = np.inf
 
         elif stats_type == 'loss':
-            for key, value in self.args.loss.items():
-                # Exclude weight keys
-                if value and isinstance(value, bool):
-                    stats[key] = np.inf
-            stats.total_loss = np.inf
+            for key in (
+                'reconstruction_loss',
+                'reliability_loss',
+                'building_edge_loss',
+                'spatial_gradient_loss',
+                'spectral_angle_loss',
+                'temporal_difference_loss',
+                'total_loss',
+            ):
+                stats[key] = np.inf
 
         return stats
 
@@ -316,9 +318,7 @@ class Trainer:
 
             for i, batch in enumerate(tnr_train):
                 self._log_iter_epoch()
-                loss = self.inference_one_batch(batch)
-                loss_dict = Prodict()
-                loss_dict.l1_loss_occluded_input_pixels = loss.detach().item()
+                loss, loss_dict = self.inference_one_batch(batch)
 
                 # Update to stats_meter
                 for key, value in loss_dict.items():
@@ -342,33 +342,26 @@ class Trainer:
                     for param in self.model.parameters():
                         param.grad = None
 
-                # if (i + 1) % min(self.args.logstep_train, len(self.dataloader['train'])) == 0:
-                #     self._log_stats_meter(phase='train')
-                #
-                #     tnr_train.set_postfix(epoch=self.epoch,
-                #                           training_loss=self.train_stats.l1_loss_occluded_input_pixels.avg
-                #                           )
-                #     if tnr is not None:
-                #         tnr.set_postfix(epoch=self.epoch,
-                #                         training_loss=self.train_stats.l1_loss_occluded_input_pixels.avg
-                #                         )
-
                 self.iter += 1
 
-            tnr_train.set_postfix(epoch=self.epoch,
-                                  training_loss=self.train_stats.l1_loss_occluded_input_pixels.avg)
+            tnr_train.set_postfix(
+                epoch=self.epoch,
+                training_loss=self.train_stats.total_loss.avg,
+            )
 
             if tnr is not None:
-                tnr.set_postfix(epoch=self.epoch,
-                                training_loss=self.train_stats.l1_loss_occluded_input_pixels.avg,
-                                best_loss=self.best_loss)
+                tnr.set_postfix(
+                    epoch=self.epoch,
+                    training_loss=self.train_stats.total_loss.avg,
+                    best_loss=self.best_loss,
+                )
 
 
             self.logger.info((f'Train:\tEpoch: {self.epoch}\t' + f'learning rate: {self._get_lr():.8f}\t'
                               ''.join([f'{k}: {v.avg:.6f}\t' for k, v in self.train_stats.items()])))
 
-            if self.best_loss > self.train_stats.l1_loss_occluded_input_pixels.avg:
-                self.best_loss = self.train_stats.l1_loss_occluded_input_pixels.avg
+            if self.best_loss > self.train_stats.total_loss.avg:
+                self.best_loss = self.train_stats.total_loss.avg
                 self.epoch_best_loss = self.epoch
                 self._save_checkpoint(self.args.path_model_best)
 
@@ -378,11 +371,123 @@ class Trainer:
 
 
 
+    @staticmethod
+    def _rgb_like_channels(frames: Tensor) -> Tensor:
+        if frames.shape[2] >= 3:
+            indices = torch.tensor([2, 1, 0], device=frames.device)
+            return frames.index_select(2, indices)
+        return frames
+
+    @staticmethod
+    def _sobel_edges(frames: Tensor) -> Tensor:
+        b, t, c, h, w = frames.shape
+        flat = frames.reshape(b * t, c, h, w)
+        kernel_x = flat.new_tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3) / 4.0
+        kernel_y = kernel_x.transpose(-1, -2)
+        kernel_x = kernel_x.repeat(c, 1, 1, 1)
+        kernel_y = kernel_y.repeat(c, 1, 1, 1)
+        grad_x = F.conv2d(flat, kernel_x, padding=1, groups=c)
+        grad_y = F.conv2d(flat, kernel_y, padding=1, groups=c)
+        return (grad_x.abs() + grad_y.abs()).reshape(b, t, c, h, w)
+
+    def _building_edge_loss(
+            self,
+            prediction: Tensor,
+            target: Tensor,
+            building_prob: Optional[Tensor],
+            loss_weight: Tensor,
+    ) -> Tensor:
+        if building_prob is None:
+            return prediction.new_tensor(0.0)
+
+        prediction_edges = self._sobel_edges(self._rgb_like_channels(prediction))
+        target_edges = self._sobel_edges(self._rgb_like_channels(target))
+        edge_weight = (loss_weight * building_prob.detach()).expand_as(prediction_edges)
+        edge_error = (prediction_edges - target_edges).abs()
+        return (
+            (edge_error * edge_weight).sum()
+            / edge_weight.sum().clamp_min(1.0)
+        )
+
+    def _reconstruction_loss(
+            self,
+            prediction: Tensor,
+            target: Tensor,
+            valid_mask: Tensor,
+    ) -> Tensor:
+        loss_type = str(
+            self.restoration_loss_args.get('reconstruction_type', 'charbonnier')
+        ).lower()
+        error = prediction - target
+        if loss_type == 'mse':
+            pointwise = error.pow(2)
+        elif loss_type == 'l1':
+            pointwise = error.abs()
+        elif loss_type == 'charbonnier':
+            eps = float(self.restoration_loss_args.get('charbonnier_eps', 1.e-3))
+            pointwise = torch.sqrt(error.pow(2) + eps * eps) - eps
+        else:
+            raise ValueError('Unsupported reconstruction loss: {}'.format(loss_type))
+        return (pointwise * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+
+    def _spatial_gradient_loss(
+            self,
+            prediction: Tensor,
+            target: Tensor,
+            loss_weight: Tensor,
+    ) -> Tensor:
+        prediction_edges = self._sobel_edges(self._rgb_like_channels(prediction))
+        target_edges = self._sobel_edges(self._rgb_like_channels(target))
+        weight = loss_weight.expand_as(prediction_edges)
+        return (
+            ((prediction_edges - target_edges).abs() * weight).sum()
+            / weight.sum().clamp_min(1.0)
+        )
+
+    @staticmethod
+    def _spectral_angle_loss(
+            prediction: Tensor,
+            target: Tensor,
+            loss_weight: Tensor,
+    ) -> Tensor:
+        prediction_01 = ((prediction + 1.0) / 2.0).clamp(0.0, 1.0)
+        target_01 = ((target + 1.0) / 2.0).clamp(0.0, 1.0)
+        cosine = F.cosine_similarity(prediction_01, target_01, dim=2, eps=1.e-6)
+        angle_error = 1.0 - cosine
+        weight = loss_weight[:, :, 0]
+        return (angle_error * weight).sum() / weight.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _temporal_difference_loss(
+            prediction: Tensor,
+            target: Tensor,
+            loss_weight: Tensor,
+            dates: Optional[Tensor],
+    ) -> Tensor:
+        if prediction.shape[1] <= 1:
+            return prediction.new_tensor(0.0)
+        if dates is None:
+            intervals = prediction.new_ones(prediction.shape[0], prediction.shape[1] - 1)
+        else:
+            intervals = (dates[:, 1:] - dates[:, :-1]).abs().to(prediction.dtype)
+            intervals = intervals.clamp_min(1.0)
+        intervals = intervals[:, :, None, None, None]
+        predicted_velocity = (prediction[:, 1:] - prediction[:, :-1]) / intervals
+        target_velocity = (target[:, 1:] - target[:, :-1]) / intervals
+        pair_weight = torch.maximum(loss_weight[:, 1:], loss_weight[:, :-1])
+        pair_weight = pair_weight.expand_as(predicted_velocity)
+        return (
+            ((predicted_velocity - target_velocity).abs() * pair_weight).sum()
+            / pair_weight.sum().clamp_min(1.0)
+        )
+
+
     def inference_one_batch(
             self, batch: Dict[str, Any]
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Dict[str, float]]:
 
-        # batch = to_device(batch, self.device)
         y_0 = batch['y'].cuda()                #  (B, T, C, H, W)
         mask = batch['masks'].cuda()           #  (B, T, 1, H, W)
         cloud_mask = batch.get('cloud_mask')
@@ -390,6 +495,12 @@ class Trainer:
         date = batch['position_days'].cuda()            #  (B, T)           'position_days' or None
         # date = None
         cond = batch['cond'].cuda()            #  (B, T, 3, H, W)
+        cond_dense = batch.get('cond_dense')
+        cond_dense = cond_dense.cuda() if cond_dense is not None else None
+        date_cond_dense = batch.get('position_days_cond_dense')
+        date_cond_dense = date_cond_dense.cuda() if date_cond_dense is not None else None
+        date_dense_target = batch.get('position_days_s2_raw')
+        date_dense_target = date_dense_target.cuda() if date_dense_target is not None else date
         bs, length = y_0.shape[0], y_0.shape[1]
 
         if self.CTHW:
@@ -413,6 +524,9 @@ class Trainer:
                 timesteps,
                 date=date,
                 cond=cond,
+                cond_dense=cond_dense,
+                date_cond_dense=date_cond_dense,
+                date_dense_target=date_dense_target,
                 cloud_mask=cloud_mask,
                 quality_target=y_0,
                 quality_only=True,
@@ -438,9 +552,27 @@ class Trainer:
             quality_mask = torch.maximum(mask, cloud_mask)
 
         model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
-        pred_hat = self.model(
-            model_input, timesteps, date=date, cond=cond, cloud_mask=quality_mask
+        landcover_loss_enabled = bool(
+            self.landcover_loss_args.get('enabled', False)
         )
+        model_output = self.model(
+            model_input,
+            timesteps,
+            date=date,
+            cond=cond,
+            cond_dense=cond_dense,
+            date_cond_dense=date_cond_dense,
+            date_dense_target=date_dense_target,
+            cloud_mask=quality_mask,
+            landcover_source=y_0,
+            return_aux=landcover_loss_enabled,
+        )
+        if isinstance(model_output, dict):
+            pred_hat = model_output['prediction']
+            building_prob = model_output.get('building_prob')
+        else:
+            pred_hat = model_output
+            building_prob = None
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
         if quality_output is not None:
@@ -453,11 +585,10 @@ class Trainer:
             supervision_confidence = (
                 reliability.detach() + (1.0 - reliability.detach()) * support
             )
-            valid_loss_mask = (mask * supervision_confidence).expand_as(y_0)
-            reconstruction_error = (pred_hat - corrected_target).pow(2)
-            reconstruction_loss = (
-                (reconstruction_error * valid_loss_mask).sum()
-                / valid_loss_mask.sum().clamp_min(1.0)
+            loss_weight = mask * supervision_confidence
+            valid_loss_mask = loss_weight.expand_as(y_0)
+            reconstruction_loss = self._reconstruction_loss(
+                pred_hat, corrected_target, valid_loss_mask
             )
 
             reliability_loss = F.binary_cross_entropy(
@@ -467,10 +598,52 @@ class Trainer:
             reliability_loss_w = float(
                 self.target_quality_args.get('reliability_loss_w', 0.25)
             )
-            loss = reconstruction_loss + reliability_loss_w * reliability_loss
+            reliability_loss = reliability_loss_w * reliability_loss
+            edge_target = corrected_target
         else:
-            valid_loss_mask = (mask * (1. - cloud_mask)).expand_as(y_0)
-            squared_error = (pred_hat - y_0).pow(2) * valid_loss_mask
-            loss = squared_error.sum() / valid_loss_mask.sum().clamp_min(1.0)
+            loss_weight = mask * (1. - cloud_mask)
+            valid_loss_mask = loss_weight.expand_as(y_0)
+            reconstruction_loss = self._reconstruction_loss(
+                pred_hat, y_0, valid_loss_mask
+            )
+            reliability_loss = pred_hat.new_tensor(0.0)
+            edge_target = y_0
 
-        return loss
+        building_edge_loss = pred_hat.new_tensor(0.0)
+        if landcover_loss_enabled and building_prob is not None:
+            edge_loss = self._building_edge_loss(
+                pred_hat, edge_target, building_prob, loss_weight
+            )
+            edge_loss_w = float(
+                self.landcover_loss_args.get('building_edge_loss_w', 0.05)
+            )
+            building_edge_loss = edge_loss_w * edge_loss
+
+        spatial_gradient_loss = self._spatial_gradient_loss(
+            pred_hat, edge_target, loss_weight
+        ) * float(self.restoration_loss_args.get('spatial_gradient_loss_w', 0.0))
+        spectral_angle_loss = self._spectral_angle_loss(
+            pred_hat, edge_target, loss_weight
+        ) * float(self.restoration_loss_args.get('spectral_angle_loss_w', 0.0))
+        temporal_difference_loss = self._temporal_difference_loss(
+            pred_hat, edge_target, loss_weight, date_dense_target
+        ) * float(self.restoration_loss_args.get('temporal_difference_loss_w', 0.0))
+
+        loss = (
+            reconstruction_loss
+            + reliability_loss
+            + building_edge_loss
+            + spatial_gradient_loss
+            + spectral_angle_loss
+            + temporal_difference_loss
+        )
+        loss_dict = {
+            'reconstruction_loss': reconstruction_loss.detach().item(),
+            'reliability_loss': reliability_loss.detach().item(),
+            'building_edge_loss': building_edge_loss.detach().item(),
+            'spatial_gradient_loss': spatial_gradient_loss.detach().item(),
+            'spectral_angle_loss': spectral_angle_loss.detach().item(),
+            'temporal_difference_loss': temporal_difference_loss.detach().item(),
+            'total_loss': loss.detach().item(),
+        }
+        return loss, loss_dict

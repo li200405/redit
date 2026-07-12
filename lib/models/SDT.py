@@ -10,24 +10,23 @@ from __future__ import annotations
 # VDT: https://github.com/RERV/VDT/blob/main/models.py
 # DiT: https://github.com/facebookresearch/DiT/blob/main/models.py
 # --------------------------------------------------------
-"""
-Codes of Denoising Transformer
-
-A Condition_TSBlock made up of:
-    1. A CrossAttentionBlock (SAR as condition).
-    2. A TemporalBlock
-    3. A SpatialBlock.
-    4. A Feed Forward Network (MLP).
-"""
+"""Sequential diffusion model with a VMamba restoration backbone."""
 
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp
 from timm.layers import DropPath
-from einops import rearrange, reduce, repeat
+from einops import rearrange
+
+from lib.models.vmamba_blocks import (
+    BidirectionalTemporalMamba,
+    HighFrequencyRefinementHead,
+    MultiScaleVMambaSpatial,
+)
 
 
 def modulate(x, shift, scale, T):
@@ -294,7 +293,7 @@ class CrossAttentionBlock(nn.Module):
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x, c, SAR):
+    def forward(self, x, c, SAR, sar_gate=None):
         # c   [B, M]
         # x   [(B T), N, M]
         # SAR [(B T), N, M]
@@ -318,6 +317,8 @@ class CrossAttentionBlock(nn.Module):
         res_cross = rearrange(res_cross, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
         res_cross = gate_ca.unsqueeze(1) * res_cross
         res_cross = rearrange(res_cross, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
+        if sar_gate is not None:
+            res_cross = res_cross * sar_gate.unsqueeze(-1)
 
         x = x + res_cross # (b t) n m
 
@@ -330,141 +331,103 @@ class CrossAttentionBlock(nn.Module):
 # out = module(x, c, SAR)
 # print(out.shape)
 
-class TemporalBlock(nn.Module):
-    """
-    A TemporalBlock with adaptive layer norm zero (adaLN-Zero) conditioning.
+class ConditionVMambaBlock(nn.Module):
+    """Restoration block with cross-modal attention and VMamba state scans.
+
+    Cross attention is retained only for aligned S1/S2 correspondence. Temporal
+    and spatial self-attention are replaced by date-aware bidirectional Mamba
+    and four-direction multi-scale visual selective scans.
     """
 
-    def __init__(self, hidden_size, num_heads, num_frames=16, **block_kwargs):
+    def __init__(
+            self,
+            hidden_size,
+            num_heads,
+            mlp_ratio=4.0,
+            num_frames=16,
+            if_cross_attention=True,
+            vmamba_expansion=1.5,
+            vmamba_date_scale_days=45.0,
+            vmamba_multiscale=True,
+            **block_kwargs,
+    ):
         super().__init__()
-        # self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        # self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-
-        self.temporal_norm1 = nn.LayerNorm(hidden_size)
-        self.temporal_attn = CloudAwareAttention(hidden_size, num_heads=num_heads, qkv_bias=True)
-
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.CrossAttentionBlock = CrossAttentionBlock(
+            hidden_size, num_heads, num_frames=num_frames
         )
-        self.num_frames = num_frames
-
-    def forward(self, x, c, cloud_mask=None):
-        shift_mta, scale_mta, gate_mta = self.adaLN_modulation(c).chunk(3, dim=1)
-        T = self.num_frames
-        K, N, M = x.shape
-        B = K // T
-
-        x_ln = modulate(self.temporal_norm1(x), shift_mta, scale_mta, self.num_frames)
-
-        # temporal attention
-        x_ln = rearrange(x_ln, '(b t) n m -> (b n) t m', b=B, t=T, n=N, m=M)
-        if cloud_mask is not None:
-            cloud_mask_temporal = rearrange(cloud_mask, '(b t) n -> (b n) t', b=B, t=T, n=N)
-        else:
-            cloud_mask_temporal = None
-        res_temporal = self.temporal_attn(x_ln, cloud_mask_temporal)
-
-        res_temporal = rearrange(res_temporal, '(b n) t m -> b (t n) m', b=B, t=T, n=N, m=M)
-        res_temporal = gate_mta.unsqueeze(1) * res_temporal
-        res_temporal = rearrange(res_temporal, 'b (t n) m -> (b t) n m', b=B, t=T, n=N, m=M)
-        # x = rearrange(x, '(b n) t m -> (b t) n m', b=B, t=T, n=N, m=M)
-        x = x + res_temporal
-
-        return x
-
-# block = TemporalBlock(384, 6, 10)
-# x = torch.randn(20, 256, 384)
-# c = torch.randn(2, 384)
-# out = block(x, c)
-# print(out.shape)
-
-class SpatialBlock(nn.Module):
-    """
-    A SpatialBlock with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-    def __init__(self, hidden_size, num_heads, num_frames=16, **block_kwargs):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = CloudAwareAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+        self.TemporalMamba = BidirectionalTemporalMamba(
+            hidden_size,
+            num_frames=num_frames,
+            expansion=vmamba_expansion,
+            date_scale_days=vmamba_date_scale_days,
         )
-        self.num_frames = num_frames
-
-    def forward(self, x, c, cloud_mask=None):
-        shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
-        T = self.num_frames
-        K, N, M = x.shape
-        B = K // T
-
-        attn = self.attn(modulate(self.norm1(x), shift_msa, scale_msa, self.num_frames), cloud_mask)
-        attn = rearrange(attn, '(b t) n m-> b (t n) m', b=B, t=T, n=N, m=M)
-        attn = gate_msa.unsqueeze(1) * attn
-        attn = rearrange(attn, 'b (t n) m-> (b t) n m', b=B, t=T, n=N, m=M)
-        x = x + attn
-
-        return x
-
-# block = SpatialBlock(384, 6, 4.0, 10)
-# x = torch.randn(20, 256, 384)
-# c = torch.randn(2, 384)
-# out = block(x, c)
-# print(out.shape)
-
-class ConditionTS_Block(nn.Module):
-    """
-    A Condition_TSBlock made up of:
-    1. A CrossAttentionBlock (SAR as condition) (optional).
-    2. A TemporalBlock
-    3. A SpatialBlock.
-    4. A Feed Forward Network (MLP).
-    """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, num_frames=16, if_cross_attention=True,**block_kwargs):
-        super().__init__()
-        self.CrossAttentionBlock = CrossAttentionBlock(hidden_size, num_heads, num_frames=num_frames)
-        self.TemporalBlock = TemporalBlock(hidden_size, num_heads, num_frames=num_frames)
-        self.SpatialBlock = SpatialBlock(hidden_size, num_heads, num_frames=num_frames)
-
+        self.SpatialVMamba = MultiScaleVMambaSpatial(
+            hidden_size,
+            num_frames=num_frames,
+            expansion=vmamba_expansion,
+            use_multiscale=vmamba_multiscale,
+        )
         self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+            nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size)
         )
         self.num_frames = num_frames
         self.ifCrossAttention = if_cross_attention
-    def forward(self, x, c, SAR, cloud_mask=None):
 
-        T = self.num_frames
-        K, N, M = x.shape
-        B = K // T
+    def forward(
+            self,
+            x,
+            c,
+            SAR,
+            cloud_mask=None,
+            landcover_gates=None,
+            dense_sar=None,
+            date_values=None,
+    ):
+        total_frames, num_tokens, hidden_size = x.shape
+        batch_size = total_frames // self.num_frames
+        sar_gate = temporal_gate = spatial_gate = None
+        if landcover_gates is not None:
+            sar_gate = landcover_gates.get("sar")
+            temporal_gate = landcover_gates.get("temporal")
+            spatial_gate = landcover_gates.get("spatial")
 
-        if self.ifCrossAttention:
-            x = self.CrossAttentionBlock(x, c, SAR)
-        x = self.TemporalBlock(x, c, cloud_mask)
-        x = self.SpatialBlock(x, c, cloud_mask)
+        if self.ifCrossAttention and SAR is not None:
+            x = self.CrossAttentionBlock(x, c, SAR, sar_gate=sar_gate)
+        x = self.TemporalMamba(
+            x,
+            c,
+            cloud_mask=cloud_mask,
+            temporal_gate=temporal_gate,
+            dense_sar=dense_sar,
+            dates=date_values,
+        )
+        x = self.SpatialVMamba(
+            x,
+            c,
+            cloud_mask=cloud_mask,
+            spatial_gate=spatial_gate,
+        )
 
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=1)
         mlp = self.mlp(modulate(self.norm(x), shift_mlp, scale_mlp, self.num_frames))
-        mlp = rearrange(mlp, '(b t) n m-> b (t n) m', b=B, t=T, n=N, m=M)
+        mlp = rearrange(
+            mlp, '(b t) n m -> b (t n) m',
+            b=batch_size, t=self.num_frames, n=num_tokens, m=hidden_size
+        )
         mlp = gate_mlp.unsqueeze(1) * mlp
-        mlp = rearrange(mlp, 'b (t n) m-> (b t) n m', b=B, t=T, n=N, m=M)
-        x = x + mlp
-
-        return x
-
-# module = ConditionTS_Block(384, 6, 4.0, 10)
-# x = torch.randn(20, 256, 384)
-# c = torch.randn(2, 384)
-# SAR = torch.randn(20, 256, 384)
-# out = module(x, c, SAR)
-# print(out.shape)
-
-
+        mlp = rearrange(
+            mlp, 'b (t n) m -> (b t) n m',
+            b=batch_size, t=self.num_frames, n=num_tokens, m=hidden_size
+        )
+        return x + mlp
 
 class FinalLayer(nn.Module):
     """
@@ -631,9 +594,171 @@ class TargetQualityRefiner(nn.Module):
         }
 
 
+class LandCoverRouter(nn.Module):
+    """
+    Rule-guided soft land-cover router.
+
+    The router does not require external land-cover labels. It estimates soft
+    patch categories from S2 vegetation dynamics and SAR/optical structure,
+    then maps them to separate gates for temporal, SAR cross, and spatial
+    attention.
+    """
+
+    def __init__(
+            self,
+            red_index=2,
+            nir_index=6,
+            min_gate=0.25,
+            built_temporal_gate=0.35,
+            built_sar_gate=1.00,
+            built_spatial_gate=1.00,
+            crop_temporal_gate=1.00,
+            crop_sar_gate=0.60,
+            crop_spatial_gate=0.70,
+            forest_temporal_gate=0.65,
+            forest_sar_gate=0.50,
+            forest_spatial_gate=0.80,
+            other_temporal_gate=0.55,
+            other_sar_gate=0.70,
+            other_spatial_gate=0.65,
+    ):
+        super().__init__()
+        self.red_index = red_index
+        self.nir_index = nir_index
+        self.min_gate = min_gate
+        self.temporal_values = (
+            built_temporal_gate,
+            crop_temporal_gate,
+            forest_temporal_gate,
+            other_temporal_gate,
+        )
+        self.sar_values = (
+            built_sar_gate,
+            crop_sar_gate,
+            forest_sar_gate,
+            other_sar_gate,
+        )
+        self.spatial_values = (
+            built_spatial_gate,
+            crop_spatial_gate,
+            forest_spatial_gate,
+            other_spatial_gate,
+        )
+
+    @staticmethod
+    def _to_unit_range(value):
+        value = value.float()
+        if value.detach().amin() < -0.05:
+            value = (value + 1.0) / 2.0
+        return value.clamp(0.0, 1.0)
+
+    @staticmethod
+    def _weighted_mean(value, valid):
+        denom = valid.sum(dim=1).clamp_min(1e-6)
+        return (value * valid).sum(dim=1) / denom
+
+    @staticmethod
+    def _weighted_change(value, valid):
+        if value.shape[1] <= 1:
+            return torch.zeros_like(value[:, 0])
+        pair_valid = valid[:, 1:] * valid[:, :-1]
+        diff = (value[:, 1:] - value[:, :-1]).abs()
+        denom = pair_valid.sum(dim=1).clamp_min(1e-6)
+        return (diff * pair_valid).sum(dim=1) / denom
+
+    @staticmethod
+    def _edge_strength(value):
+        kernel_x = value.new_tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]]
+        ).view(1, 1, 3, 3) / 4.0
+        kernel_y = kernel_x.transpose(-1, -2)
+        grad_x = F.conv2d(value, kernel_x, padding=1)
+        grad_y = F.conv2d(value, kernel_y, padding=1)
+        return (grad_x.abs() + grad_y.abs()).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _sigmoid_score(value, center, temperature):
+        return torch.sigmoid((value - center) / max(temperature, 1e-6))
+
+    def _class_probabilities(self, optical, cond=None, cloud_mask=None):
+        B, T, C, H, W = optical.shape
+        optical = self._to_unit_range(optical)
+        if cloud_mask is None:
+            clear = torch.ones((B, T, 1, H, W), device=optical.device, dtype=optical.dtype)
+        else:
+            clear = 1.0 - cloud_mask.float().clamp(0.0, 1.0)
+
+        red_idx = min(max(self.red_index, 0), C - 1)
+        nir_idx = min(max(self.nir_index, 0), C - 1)
+        red = optical[:, :, red_idx:red_idx + 1]
+        nir = optical[:, :, nir_idx:nir_idx + 1]
+        ndvi = ((nir - red) / (nir + red + 1e-6)).clamp(-1.0, 1.0)
+        mean_ndvi = self._weighted_mean(ndvi, clear)
+        ndvi_change = self._weighted_change(ndvi, clear)
+        mean_nir = self._weighted_mean(nir, clear)
+
+        rgb_like = optical[:, :, :min(3, C)].mean(dim=2, keepdim=True)
+        mean_rgb = self._weighted_mean(rgb_like, clear)
+        optical_edge = self._edge_strength(mean_rgb)
+
+        structure = optical_edge
+        if cond is not None and cond.shape[1] == T:
+            sar = self._to_unit_range(cond)
+            sar_scalar = sar.mean(dim=2, keepdim=True)
+            sar_valid = torch.ones_like(sar_scalar[:, :, :1])
+            mean_sar = self._weighted_mean(sar_scalar, sar_valid)
+            sar_edge = self._edge_strength(mean_sar)
+            structure = torch.maximum(structure, sar_edge)
+
+        low_veg = self._sigmoid_score(0.30 - mean_ndvi, 0.0, 0.08)
+        low_change = self._sigmoid_score(0.08 - ndvi_change, 0.0, 0.035)
+        structured = self._sigmoid_score(structure, 0.08, 0.035)
+        built_score = low_veg * (0.4 + 0.6 * structured) * (0.5 + 0.5 * low_change)
+
+        vegetated = self._sigmoid_score(mean_ndvi, 0.25, 0.08)
+        seasonal = self._sigmoid_score(ndvi_change, 0.045, 0.025)
+        crop_score = vegetated * seasonal
+
+        high_veg = self._sigmoid_score(mean_ndvi, 0.38, 0.08)
+        stable_veg = self._sigmoid_score(0.065 - ndvi_change, 0.0, 0.03)
+        forest_score = high_veg * stable_veg
+
+        low_nir = self._sigmoid_score(0.18 - mean_nir, 0.0, 0.08)
+        water_or_shadow = low_nir * self._sigmoid_score(0.10 - mean_ndvi, 0.0, 0.08)
+        other_score = 0.20 + water_or_shadow
+
+        scores = torch.cat(
+            [built_score, crop_score, forest_score, other_score], dim=1
+        ).clamp_min(1e-4)
+        return scores / scores.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    def _mix_gate(self, probabilities, values):
+        gate_values = probabilities.new_tensor(values).view(1, 4, 1, 1)
+        gate = (probabilities * gate_values).sum(dim=1, keepdim=True)
+        return gate.clamp(self.min_gate, 1.0)
+
+    def forward(self, optical, cond=None, cloud_mask=None):
+        B, T, _, H, W = optical.shape
+        probabilities = self._class_probabilities(optical, cond=cond, cloud_mask=cloud_mask)
+
+        temporal_gate = self._mix_gate(probabilities, self.temporal_values)
+        sar_gate = self._mix_gate(probabilities, self.sar_values)
+        spatial_gate = self._mix_gate(probabilities, self.spatial_values)
+
+        return {
+            "landcover_probs": probabilities,
+            "building_prob": probabilities[:, 0:1].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "crop_prob": probabilities[:, 1:2].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "forest_prob": probabilities[:, 2:3].unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "temporal_gate": temporal_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "sar_gate": sar_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+            "spatial_gate": spatial_gate.unsqueeze(1).expand(-1, T, -1, -1, -1),
+        }
+
+
 class SDT(nn.Module):
     """
-    Sequential Denoising Transformer.
+    Sequential diffusion restoration model with a VMamba backbone.
     """
 
     def __init__(
@@ -658,6 +783,25 @@ class SDT(nn.Module):
             target_quality_residual_temperature=0.12,
             target_quality_temporal_scale_days=45.0,
             target_quality_sar_temperature=0.5,
+            landcover_router_enabled=False,
+            landcover_min_gate=0.25,
+            landcover_built_temporal_gate=0.35,
+            landcover_built_sar_gate=1.00,
+            landcover_built_spatial_gate=1.00,
+            landcover_crop_temporal_gate=1.00,
+            landcover_crop_sar_gate=0.60,
+            landcover_crop_spatial_gate=0.70,
+            landcover_forest_temporal_gate=0.65,
+            landcover_forest_sar_gate=0.50,
+            landcover_forest_spatial_gate=0.80,
+            landcover_other_temporal_gate=0.55,
+            landcover_other_sar_gate=0.70,
+            landcover_other_spatial_gate=0.65,
+            dense_sar_temporal_scale_days=18.0,
+            dense_sar_topk=9,
+            vmamba_expansion=1.5,
+            vmamba_date_scale_days=45.0,
+            detail_hidden_channels=64,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -669,6 +813,9 @@ class SDT(nn.Module):
         self.cloud_aware_attention = cloud_aware_attention
         self.use_cloud_mask_embedding = use_cloud_mask_embedding
         self.target_quality_refinement = target_quality_refinement
+        self.landcover_router_enabled = landcover_router_enabled
+        self.dense_sar_temporal_scale_days = dense_sar_temporal_scale_days
+        self.dense_sar_topk = int(dense_sar_topk) if dense_sar_topk is not None else 0
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.cond_embedder = PatchEmbed(input_size, patch_size, cond_in_channels, hidden_size, bias=True)
@@ -682,6 +829,21 @@ class SDT(nn.Module):
             temporal_scale_days=target_quality_temporal_scale_days,
             sar_temperature=target_quality_sar_temperature,
         ) if target_quality_refinement else None
+        self.landcover_router = LandCoverRouter(
+            min_gate=landcover_min_gate,
+            built_temporal_gate=landcover_built_temporal_gate,
+            built_sar_gate=landcover_built_sar_gate,
+            built_spatial_gate=landcover_built_spatial_gate,
+            crop_temporal_gate=landcover_crop_temporal_gate,
+            crop_sar_gate=landcover_crop_sar_gate,
+            crop_spatial_gate=landcover_crop_spatial_gate,
+            forest_temporal_gate=landcover_forest_temporal_gate,
+            forest_sar_gate=landcover_forest_sar_gate,
+            forest_spatial_gate=landcover_forest_spatial_gate,
+            other_temporal_gate=landcover_other_temporal_gate,
+            other_sar_gate=landcover_other_sar_gate,
+            other_spatial_gate=landcover_other_spatial_gate,
+        ) if landcover_router_enabled else None
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -693,11 +855,26 @@ class SDT(nn.Module):
 
 
         self.blocks = nn.ModuleList(
-            ConditionTS_Block(hidden_size, num_heads, mlp_ratio=mlp_ratio, num_frames=self.num_frames, if_cross_attention=self.cross_attention)
+            ConditionVMambaBlock(
+                hidden_size,
+                num_heads,
+                mlp_ratio=mlp_ratio,
+                num_frames=self.num_frames,
+                if_cross_attention=self.cross_attention,
+                vmamba_expansion=vmamba_expansion,
+                vmamba_date_scale_days=vmamba_date_scale_days,
+                vmamba_multiscale=True,
+            )
             for _ in range(depth)
         )
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, self.num_frames)
+        self.detail_refiner = HighFrequencyRefinementHead(
+            out_channels=self.out_channels,
+            input_channels=self.in_channels,
+            cond_channels=self.cond_in_channels,
+            hidden_channels=detail_hidden_channels,
+        )
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -744,11 +921,11 @@ class SDT(nn.Module):
                 nn.init.constant_(TSblock.CrossAttentionBlock.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(TSblock.CrossAttentionBlock.adaLN_modulation[-1].bias, 0)
 
-            nn.init.constant_(TSblock.TemporalBlock.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(TSblock.TemporalBlock.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(TSblock.TemporalMamba.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(TSblock.TemporalMamba.adaLN_modulation[-1].bias, 0)
 
-            nn.init.constant_(TSblock.SpatialBlock.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(TSblock.SpatialBlock.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(TSblock.SpatialVMamba.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(TSblock.SpatialVMamba.adaLN_modulation[-1].bias, 0)
 
             nn.init.constant_(TSblock.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(TSblock.adaLN_modulation[-1].bias, 0)
@@ -758,6 +935,7 @@ class SDT(nn.Module):
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+        self.detail_refiner.zero_init()
 
     def unpatchify(self, x):
         """
@@ -774,17 +952,63 @@ class SDT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
+    def _prepare_dense_dates(self, target_dates, source_dates, batch_size, target_length, source_length, device):
+        if target_dates is None:
+            target_dates = torch.arange(target_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            target_dates = target_dates.to(device)
+            if target_dates.dim() == 1:
+                target_dates = target_dates.unsqueeze(0).expand(batch_size, -1)
+
+        if source_dates is None:
+            source_dates = torch.arange(source_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        else:
+            source_dates = source_dates.to(device)
+            if source_dates.dim() == 1:
+                source_dates = source_dates.unsqueeze(0).expand(batch_size, -1)
+
+        return target_dates, source_dates
+
+    def _aggregate_dense_sar(self, cond_dense, target_dates=None, source_dates=None):
+        B, source_length, C, H, W = cond_dense.shape
+        target_dates, source_dates = self._prepare_dense_dates(
+            target_dates,
+            source_dates,
+            B,
+            self.num_frames,
+            source_length,
+            cond_dense.device,
+        )
+        date_distance = (
+            target_dates[:, :, None].float() - source_dates[:, None, :].float()
+        ).abs()
+        logits = -date_distance / max(float(self.dense_sar_temporal_scale_days), 1e-6)
+
+        if 0 < self.dense_sar_topk < source_length:
+            topk_indices = logits.topk(self.dense_sar_topk, dim=-1).indices
+            topk_mask = torch.zeros_like(logits, dtype=torch.bool)
+            topk_mask.scatter_(-1, topk_indices, True)
+            logits = logits.masked_fill(~topk_mask, torch.finfo(logits.dtype).min)
+
+        weights = logits.softmax(dim=-1).to(cond_dense.dtype)
+        return torch.einsum('btd,bdchw->btchw', weights, cond_dense)
+
     def forward(
             self,
             x,
             t,
             date=None,
             cond=None,
+            cond_dense=None,
+            date_cond_dense=None,
+            date_dense_target=None,
             cloud_mask=None,
             location=None,
             semantics=None,
             quality_target=None,
             quality_only=False,
+            landcover_source=None,
+            return_aux=False,
     ):
         """
         Forward pass of SDT.
@@ -792,6 +1016,7 @@ class SDT(nn.Module):
         t: (B,) tensor of diffusion timesteps
         date: (B, T) tensor of dates
         cond: same with x, conditional inputs such as SAR images
+        cond_dense: denser SAR sequence, e.g. (B, 46, C_sar, H, W)
         """
 
         if quality_target is not None and self.target_quality_refiner is not None:
@@ -804,6 +1029,25 @@ class SDT(nn.Module):
             raise ValueError("quality_only=True requires target quality refinement and quality_target.")
 
         B, T, C, H, W = x.shape
+        model_input_sequence = x
+        condition_sequence = cond
+        cloud_mask_sequence = cloud_mask
+        landcover_output = None
+        landcover_gates = None
+        if self.landcover_router is not None:
+            router_source = landcover_source if landcover_source is not None else x
+            landcover_output = self.landcover_router(
+                router_source, cond=cond, cloud_mask=cloud_mask_sequence
+            )
+            patch_size = self.x_embedder.patch_size[0]
+            landcover_gates = {}
+            for name in ("sar", "temporal", "spatial"):
+                gate = landcover_output[f"{name}_gate"].reshape(B * T, 1, H, W)
+                gate = F.avg_pool2d(
+                    gate, kernel_size=patch_size, stride=patch_size
+                ).flatten(1).clamp(0.0, 1.0)
+                landcover_gates[name] = gate
+
         # N = int(H * W / self.patch_size ** 2)
         x = x.contiguous().view(-1, C, H, W)
         x = self.x_embedder(x) + self.pos_embed  # ((B T), N, M), where N = H * W / patch_size ** 2
@@ -828,11 +1072,14 @@ class SDT(nn.Module):
         #     y = self.y_embedder(y, self.training)  # (B, M)
         #     c = t + y  # (B, M)
 
+        date_values = date
+        date_tokens = None
+
         # date embedding:
         if date is not None:
-            date = self.date_embedder(date)
-            date = rearrange(date, 'b t m -> (b t) 1 m', b=B, t=T)
-            x = x + date
+            date_tokens = self.date_embedder(date)
+            date_tokens = rearrange(date_tokens, 'b t m -> (b t) 1 m', b=B, t=T)
+            x = x + date_tokens
         else:
             # if dates are not provided
             x = rearrange(x, '(b t) n m -> (b n) t m', b=B, t=T)
@@ -845,29 +1092,78 @@ class SDT(nn.Module):
         if location is not None:
             pass
 
-        # 在这里添加SAR embedding
+        # Embed the date-aligned SAR condition at the same patch resolution.
         if cond is not None:
             cond = cond.contiguous().view(-1, self.cond_in_channels, H, W)
             cond = self.cond_embedder(cond) + self.pos_embed  # ((B T), N, M), where N = H * W / patch_size ** 2
 
-            if date is not None:
-                cond = cond + date
+            if date_tokens is not None:
+                cond = cond + date_tokens
             else:
                 cond = rearrange(cond, '(b t) n m -> (b n) t m', b=B, t=T)
                 cond = cond + self.time_embed
                 cond = self.time_drop(cond)
                 cond = rearrange(cond, '(b n) t m -> (b t) n m', b=B, t=T)
 
+        dense_sar_tokens = None
+        dense_sar_dates = date_dense_target if date_dense_target is not None else date_values
+        if cond_dense is not None:
+            if dense_sar_dates is not None:
+                dense_sar_dates = dense_sar_dates.to(cond_dense.device)
+                if dense_sar_dates.dim() == 1:
+                    dense_sar_dates = dense_sar_dates.unsqueeze(0).expand(B, -1)
+            dense_sar_memory = self._aggregate_dense_sar(
+                cond_dense,
+                target_dates=dense_sar_dates,
+                source_dates=date_cond_dense,
+            )
+            dense_sar_tokens = dense_sar_memory.contiguous().view(-1, self.cond_in_channels, H, W)
+            dense_sar_tokens = self.cond_embedder(dense_sar_tokens) + self.pos_embed
+
+            if dense_sar_dates is not None:
+                dense_date_tokens = self.date_embedder(dense_sar_dates)
+                dense_date_tokens = rearrange(
+                    dense_date_tokens, 'b t m -> (b t) 1 m', b=B, t=T
+                )
+                dense_sar_tokens = dense_sar_tokens + dense_date_tokens
+            else:
+                dense_sar_tokens = rearrange(
+                    dense_sar_tokens, '(b t) n m -> (b n) t m', b=B, t=T
+                )
+                dense_sar_tokens = dense_sar_tokens + self.time_embed
+                dense_sar_tokens = self.time_drop(dense_sar_tokens)
+                dense_sar_tokens = rearrange(
+                    dense_sar_tokens, '(b n) t m -> (b t) n m', b=B, t=T
+                )
 
         attn_cloud_mask = cloud_mask_tokens if self.cloud_aware_attention else None
         for block in self.blocks:
-            x = block(x, c, cond, attn_cloud_mask)
+            x = block(
+                x,
+                c,
+                cond,
+                attn_cloud_mask,
+                landcover_gates,
+                dense_sar=dense_sar_tokens,
+                date_values=dense_sar_dates,
+            )
 
 
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
 
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         x = x.view(B, T, x.shape[-3], x.shape[-2], x.shape[-1])
+        x = self.detail_refiner(
+            x,
+            model_input_sequence,
+            condition_sequence,
+            cloud_mask_sequence,
+        )
+        if return_aux:
+            output = {"prediction": x}
+            if landcover_output is not None:
+                output.update(landcover_output)
+            return output
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
