@@ -1,0 +1,223 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1450" viewBox="0 0 2400 1450">
+  <defs>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M 0 0 L 11 5.5 L 0 11 z" fill="#2f3b4a"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M 0 0 L 11 5.5 L 0 11 z" fill="#2b6cb0"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M 0 0 L 11 5.5 L 0 11 z" fill="#2f855a"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto">
+      <path d="M 0 0 L 11 5.5 L 0 11 z" fill="#c05621"/>
+    </marker>
+    <style>
+      .title { font-family: Arial, Helvetica, sans-serif; font-size: 38px; font-weight: 700; fill: #172033; }
+      .subtitle { font-family: Arial, Helvetica, sans-serif; font-size: 20px; fill: #4a5568; }
+      .section { font-family: Arial, Helvetica, sans-serif; font-size: 21px; font-weight: 700; letter-spacing: 1.4px; fill: #334155; }
+      .block-title { font-family: Arial, Helvetica, sans-serif; font-size: 22px; font-weight: 700; fill: #172033; }
+      .block-small { font-family: Arial, Helvetica, sans-serif; font-size: 17px; fill: #334155; }
+      .tiny { font-family: Arial, Helvetica, sans-serif; font-size: 14px; fill: #52606d; }
+      .inside { font-family: Arial, Helvetica, sans-serif; font-size: 16px; font-weight: 700; fill: #172033; }
+      .note { font-family: Arial, Helvetica, sans-serif; font-size: 15px; fill: #52606d; }
+      .arrow { stroke: #2f3b4a; stroke-width: 3.2; fill: none; marker-end: url(#arrow); }
+      .arrow-blue { stroke: #2b6cb0; stroke-width: 3.2; fill: none; marker-end: url(#arrowBlue); }
+      .arrow-green { stroke: #2f855a; stroke-width: 3.2; fill: none; marker-end: url(#arrowGreen); }
+      .arrow-orange { stroke: #c05621; stroke-width: 3.2; fill: none; marker-end: url(#arrowOrange); }
+      .dash { stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect width="2400" height="1450" fill="#ffffff"/>
+  <rect x="28" y="25" width="2344" height="1400" rx="18" fill="#fbfcfe" stroke="#d4dde8" stroke-width="2"/>
+
+  <text x="1200" y="93" text-anchor="middle" class="title">REDiT: Multimodal Sequential Diffusion Transformer for Cloudy Sentinel-2 Reconstruction</text>
+  <text x="1200" y="128" text-anchor="middle" class="subtitle">S2 optical time series reconstruction conditioned on SAR, acquisition dates, cloud masks, and dense SAR temporal memory</text>
+
+  <!-- Input section -->
+  <text x="95" y="204" class="section">INPUTS</text>
+  <line x1="95" y1="220" x2="565" y2="220" stroke="#cbd5e1" stroke-width="2"/>
+
+  <g>
+    <rect x="95" y="255" width="420" height="138" rx="14" fill="#e9f2fb" stroke="#78a9d4" stroke-width="2.4"/>
+    <rect x="119" y="282" width="68" height="68" rx="7" fill="#2b6cb0" opacity="0.9"/>
+    <path d="M126 338 L146 316 L161 331 L177 304" fill="none" stroke="#ffffff" stroke-width="4"/>
+    <circle cx="165" cy="298" r="7" fill="#fed7aa"/>
+    <text x="208" y="295" class="block-title">Clear S2 target sequence y₀</text>
+    <text x="208" y="324" class="block-small">13 frames × 10 bands × 128 × 128</text>
+    <text x="208" y="352" class="block-small">normalized reflectance in [−1, 1]</text>
+    <text x="208" y="376" class="tiny">target for diffusion denoising supervision</text>
+  </g>
+
+  <g>
+    <rect x="95" y="430" width="420" height="138" rx="14" fill="#fdf1e7" stroke="#e49a63" stroke-width="2.4"/>
+    <rect x="119" y="456" width="68" height="68" rx="7" fill="#c05621" opacity="0.95"/>
+    <path d="M127 511 L180 458 M127 458 L180 511" stroke="#ffffff" stroke-width="4.5"/>
+    <text x="208" y="470" class="block-title">Cloud mask bank</text>
+    <text x="208" y="499" class="block-small">simulated occlusion mask: 13 × 1 × 128 × 128</text>
+    <text x="208" y="527" class="block-small">coverage sampling: 65% / 25% / 7% / 3%</text>
+    <text x="208" y="551" class="tiny">real cloud mask also identifies unreliable targets</text>
+  </g>
+
+  <g>
+    <rect x="95" y="605" width="420" height="138" rx="14" fill="#eaf7ef" stroke="#68b68b" stroke-width="2.4"/>
+    <rect x="119" y="631" width="68" height="68" rx="7" fill="#2f855a" opacity="0.95"/>
+    <path d="M128 680 C142 648, 160 648, 178 680" fill="none" stroke="#ffffff" stroke-width="4"/>
+    <path d="M128 662 C142 688, 160 688, 178 662" fill="none" stroke="#ffffff" stroke-width="4"/>
+    <text x="208" y="645" class="block-title">Aligned Sentinel-1 condition</text>
+    <text x="208" y="674" class="block-small">nearest S1 date per S2 frame: 13 × 2 × 128 × 128</text>
+    <text x="208" y="702" class="block-small">VV / VH structural information</text>
+    <text x="208" y="726" class="tiny">used by spatial and temporal cross-modal fusion</text>
+  </g>
+
+  <g>
+    <rect x="95" y="780" width="420" height="138" rx="14" fill="#f4effb" stroke="#9f7aea" stroke-width="2.4"/>
+    <rect x="119" y="806" width="68" height="68" rx="7" fill="#805ad5" opacity="0.95"/>
+    <path d="M132 842 H174 M153 821 V863" stroke="#ffffff" stroke-width="4"/>
+    <text x="208" y="820" class="block-title">Dates and dense SAR sequence</text>
+    <text x="208" y="849" class="block-small">S2 acquisition dates + all available S1 dates</text>
+    <text x="208" y="877" class="block-small">dense SAR: e.g. 46 frames × 2 × 128 × 128</text>
+    <text x="208" y="901" class="tiny">real date differences guide temporal correspondence</text>
+  </g>
+
+  <!-- training construction -->
+  <text x="650" y="204" class="section">DIFFUSION TRAINING INPUT</text>
+  <line x1="650" y1="220" x2="1110" y2="220" stroke="#cbd5e1" stroke-width="2"/>
+  <g>
+    <rect x="620" y="285" width="455" height="158" rx="14" fill="#f6f8fb" stroke="#aab7c6" stroke-width="2.4"/>
+    <text x="848" y="325" text-anchor="middle" class="block-title">Forward diffusion and quality control</text>
+    <text x="848" y="358" text-anchor="middle" class="block-small">sample t ∈ [0, 999], then add Gaussian noise to y₀</text>
+    <text x="848" y="388" text-anchor="middle" class="block-small">Target Quality Refiner builds a temporal consensus</text>
+    <text x="848" y="416" text-anchor="middle" class="tiny">model input = noisy S2 in masked pixels + clear S2 in observed pixels</text>
+  </g>
+  <path d="M515 324 H620" class="arrow-blue"/>
+  <path d="M515 499 H575 V380 H620" class="arrow-orange"/>
+  <path d="M515 849 H575 V410 H620" class="arrow-green"/>
+
+  <g>
+    <rect x="620" y="505" width="455" height="128" rx="14" fill="#fff8e8" stroke="#d6ae4d" stroke-width="2.4"/>
+    <text x="848" y="546" text-anchor="middle" class="block-title">Land-cover router</text>
+    <text x="848" y="576" text-anchor="middle" class="block-small">soft building / crop / forest / other probabilities</text>
+    <text x="848" y="605" text-anchor="middle" class="tiny">produces SAR, temporal, and spatial gates</text>
+  </g>
+  <path d="M848 443 V505" class="arrow"/>
+
+  <!-- embeddings -->
+  <text x="1180" y="204" class="section">TOKENIZATION AND CONDITIONING</text>
+  <line x1="1180" y1="220" x2="1740" y2="220" stroke="#cbd5e1" stroke-width="2"/>
+  <g>
+    <rect x="1155" y="285" width="540" height="348" rx="16" fill="#f8fbff" stroke="#7ba7cf" stroke-width="2.4"/>
+    <text x="1425" y="323" text-anchor="middle" class="block-title">S2 / S1 token construction</text>
+    <rect x="1190" y="354" width="210" height="95" rx="10" fill="#dceefa" stroke="#78a9d4" stroke-width="1.8"/>
+    <text x="1295" y="388" text-anchor="middle" class="inside">Patch Embedding</text>
+    <text x="1295" y="415" text-anchor="middle" class="tiny">8 × 8 patches → 16 × 16 = 256 tokens</text>
+    <text x="1295" y="437" text-anchor="middle" class="tiny">10-channel S2 or 2-channel S1 → 256-dim</text>
+    <rect x="1450" y="354" width="210" height="95" rx="10" fill="#f1ebfb" stroke="#9f7aea" stroke-width="1.8"/>
+    <text x="1555" y="388" text-anchor="middle" class="inside">Date Embedding</text>
+    <text x="1555" y="415" text-anchor="middle" class="tiny">absolute acquisition date per frame</text>
+    <text x="1555" y="437" text-anchor="middle" class="tiny">added to S2 and aligned S1 tokens</text>
+    <rect x="1190" y="485" width="210" height="95" rx="10" fill="#fdf1e7" stroke="#e49a63" stroke-width="1.8"/>
+    <text x="1295" y="519" text-anchor="middle" class="inside">Cloud-mask Embedding</text>
+    <text x="1295" y="546" text-anchor="middle" class="tiny">mean cloud fraction in each 8 × 8 patch</text>
+    <text x="1295" y="568" text-anchor="middle" class="tiny">marks unreliable token content</text>
+    <rect x="1450" y="485" width="210" height="95" rx="10" fill="#eaf7ef" stroke="#68b68b" stroke-width="1.8"/>
+    <text x="1555" y="519" text-anchor="middle" class="inside">Dense SAR Aggregation</text>
+    <text x="1555" y="546" text-anchor="middle" class="tiny">date-weighted nearest SAR memory</text>
+    <text x="1555" y="568" text-anchor="middle" class="tiny">top-9 SAR dates around each S2 date</text>
+  </g>
+  <path d="M1075 364 H1155" class="arrow"/>
+  <path d="M515 674 H1120 V532 H1155" class="arrow-green"/>
+  <path d="M515 849 H1100 V401 H1450" class="arrow-orange"/>
+
+  <!-- Main backbone -->
+  <text x="1805" y="204" class="section">SEQUENTIAL DENOISING TRANSFORMER</text>
+  <line x1="1805" y1="220" x2="2310" y2="220" stroke="#cbd5e1" stroke-width="2"/>
+  <g>
+    <rect x="1760" y="260" width="555" height="660" rx="18" fill="#f9fbfd" stroke="#5e7f9e" stroke-width="2.8"/>
+    <rect x="1790" y="286" width="495" height="45" rx="8" fill="#dceafa"/>
+    <text x="2038" y="316" text-anchor="middle" class="block-title">ConditionTS Block × 4</text>
+
+    <rect x="1812" y="360" width="450" height="76" rx="10" fill="#eaf7ef" stroke="#68b68b" stroke-width="1.8"/>
+    <text x="2037" y="391" text-anchor="middle" class="inside">1. S2–S1 Cross Attention</text>
+    <text x="2037" y="415" text-anchor="middle" class="tiny">S2 queries, S1 keys / values; spatial then temporal fusion</text>
+
+    <rect x="1812" y="457" width="450" height="92" rx="10" fill="#f1ebfb" stroke="#9f7aea" stroke-width="1.8"/>
+    <text x="2037" y="489" text-anchor="middle" class="inside">2. Dense SAR Temporal Memory</text>
+    <text x="2037" y="514" text-anchor="middle" class="tiny">S2 values remain unchanged; dense SAR only biases temporal attention</text>
+    <text x="2037" y="535" text-anchor="middle" class="tiny">date distance + SAR similarity + cloud reliability</text>
+
+    <rect x="1812" y="570" width="450" height="78" rx="10" fill="#e9f2fb" stroke="#78a9d4" stroke-width="1.8"/>
+    <text x="2037" y="601" text-anchor="middle" class="inside">3. Temporal Self-Attention</text>
+    <text x="2037" y="625" text-anchor="middle" class="tiny">for one spatial patch, attend across 13 S2 dates</text>
+
+    <rect x="1812" y="669" width="450" height="78" rx="10" fill="#e9f2fb" stroke="#78a9d4" stroke-width="1.8"/>
+    <text x="2037" y="700" text-anchor="middle" class="inside">4. Spatial Self-Attention</text>
+    <text x="2037" y="724" text-anchor="middle" class="tiny">for one date, attend across all 16 × 16 spatial patches</text>
+
+    <rect x="1812" y="768" width="450" height="72" rx="10" fill="#f5f6f8" stroke="#aab7c6" stroke-width="1.8"/>
+    <text x="2037" y="798" text-anchor="middle" class="inside">5. AdaLN-conditioned MLP</text>
+    <text x="2037" y="821" text-anchor="middle" class="tiny">diffusion timestep controls feature modulation and residual gates</text>
+
+    <path d="M2037 436 V457" class="arrow"/>
+    <path d="M2037 549 V570" class="arrow"/>
+    <path d="M2037 648 V669" class="arrow"/>
+    <path d="M2037 747 V768" class="arrow"/>
+  </g>
+
+  <path d="M1695 458 H1760" class="arrow-blue"/>
+  <path d="M1695 532 H1730 V503 H1812" class="arrow-green"/>
+  <path d="M1075 569 H1735 V406 H1812" class="arrow-orange dash"/>
+  <text x="1455" y="553" text-anchor="middle" class="note">land-cover gates: regulate SAR / temporal / spatial residual strength</text>
+
+  <!-- output row -->
+  <text x="95" y="1010" class="section">OUTPUT AND REVERSE DIFFUSION</text>
+  <line x1="95" y1="1026" x2="2310" y2="1026" stroke="#cbd5e1" stroke-width="2"/>
+
+  <g>
+    <rect x="310" y="1080" width="430" height="138" rx="15" fill="#f5f6f8" stroke="#aab7c6" stroke-width="2.4"/>
+    <text x="525" y="1122" text-anchor="middle" class="block-title">Final Layer</text>
+    <text x="525" y="1154" text-anchor="middle" class="block-small">256-dim token → 8 × 8 × 10 values</text>
+    <text x="525" y="1184" text-anchor="middle" class="tiny">one predicted 8 × 8 ten-band patch per token</text>
+  </g>
+  <path d="M2037 920 V982 H525 V1080" class="arrow"/>
+
+  <g>
+    <rect x="870" y="1080" width="430" height="138" rx="15" fill="#e9f2fb" stroke="#78a9d4" stroke-width="2.4"/>
+    <text x="1085" y="1122" text-anchor="middle" class="block-title">Unpatchify</text>
+    <text x="1085" y="1154" text-anchor="middle" class="block-small">16 × 16 patch grid → 128 × 128 image</text>
+    <text x="1085" y="1184" text-anchor="middle" class="tiny">reassemble all 10 spectral bands per frame</text>
+  </g>
+  <path d="M740 1149 H870" class="arrow"/>
+
+  <g>
+    <rect x="1430" y="1080" width="430" height="138" rx="15" fill="#fdf1e7" stroke="#e49a63" stroke-width="2.4"/>
+    <text x="1645" y="1122" text-anchor="middle" class="block-title">Reverse Diffusion Scheduler</text>
+    <text x="1645" y="1154" text-anchor="middle" class="block-small">DPM-Solver, e.g. 10 denoising steps</text>
+    <text x="1645" y="1184" text-anchor="middle" class="tiny">masked pixels are progressively denoised; clear pixels are preserved</text>
+  </g>
+  <path d="M1300 1149 H1430" class="arrow"/>
+
+  <g>
+    <rect x="1990" y="1080" width="270" height="138" rx="15" fill="#eaf7ef" stroke="#68b68b" stroke-width="2.8"/>
+    <text x="2125" y="1122" text-anchor="middle" class="block-title">Reconstructed S2</text>
+    <text x="2125" y="1154" text-anchor="middle" class="block-small">13 × 10 × 128 × 128</text>
+    <text x="2125" y="1184" text-anchor="middle" class="tiny">cloud-free ten-band time series</text>
+  </g>
+  <path d="M1860 1149 H1990" class="arrow"/>
+
+  <!-- Legend and notes -->
+  <g>
+    <rect x="95" y="1270" width="2180" height="112" rx="14" fill="#ffffff" stroke="#d4dde8" stroke-width="1.8"/>
+    <text x="130" y="1308" class="block-title">Legend</text>
+    <rect x="270" y="1287" width="26" height="20" rx="4" fill="#e9f2fb" stroke="#78a9d4"/>
+    <text x="307" y="1304" class="note">optical S2 / Transformer features</text>
+    <rect x="590" y="1287" width="26" height="20" rx="4" fill="#eaf7ef" stroke="#68b68b"/>
+    <text x="627" y="1304" class="note">SAR condition / cross-modal information</text>
+    <rect x="970" y="1287" width="26" height="20" rx="4" fill="#fdf1e7" stroke="#e49a63"/>
+    <text x="1007" y="1304" class="note">masking / diffusion sampling</text>
+    <rect x="1286" y="1287" width="26" height="20" rx="4" fill="#f1ebfb" stroke="#9f7aea"/>
+    <text x="1323" y="1304" class="note">dates and dense temporal memory</text>
+    <text x="130" y="1350" class="note">Training predicts the clean S2 sample; inference starts from random noise only inside cloud-masked pixels and enforces the observed clear pixels at every reverse-diffusion step.</text>
+  </g>
+</svg>

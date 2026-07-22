@@ -198,11 +198,14 @@ class CrossAttention(nn.Module):
         # BNC -> BNH(C/H) -> BHN(C/H)
         v = self.wv(SAR).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale  # BHN(C/H) @ BH(C/H)N -> BHNN
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)  # (BHNN @ BHN(C/H)) -> BHN(C/H) -> BNH(C/H) -> BNC
+        # Lets PyTorch select FlashAttention, memory-efficient attention, or
+        # its math fallback for the active GPU. This avoids materializing the
+        # B x heads x tokens x tokens attention matrix when a fused kernel is
+        # available (notably on Ampere/Ada GPUs).
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=dropout_p, scale=self.scale
+        ).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -823,6 +826,9 @@ class SDT(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.date_embedder = DateEmbedder(hidden_size, T=10000)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        # Class labels are not part of the satellite reconstruction objective.
+        # Keep this legacy embedding out of DDP gradient synchronization.
+        self.y_embedder.requires_grad_(False)
         self.target_quality_refiner = TargetQualityRefiner(
             hidden_channels=target_quality_hidden,
             residual_temperature=target_quality_residual_temperature,
@@ -1006,6 +1012,8 @@ class SDT(nn.Module):
             location=None,
             semantics=None,
             quality_target=None,
+            quality_input_mask=None,
+            quality_strength=1.0,
             quality_only=False,
             landcover_source=None,
             return_aux=False,
@@ -1017,14 +1025,28 @@ class SDT(nn.Module):
         date: (B, T) tensor of dates
         cond: same with x, conditional inputs such as SAR images
         cond_dense: denser SAR sequence, e.g. (B, 46, C_sar, H, W)
+        quality_input_mask: simulated cloud mask used to build the diffusion input
         """
 
+        quality_output = None
         if quality_target is not None and self.target_quality_refiner is not None:
             quality_output = self.target_quality_refiner(
                 quality_target, cond=cond, dates=date, known_cloud_mask=cloud_mask
             )
             if quality_only:
                 return quality_output
+            if quality_input_mask is not None:
+                if cloud_mask is None:
+                    cloud_mask = torch.zeros_like(quality_input_mask)
+                known_clear = 1.0 - cloud_mask.float().clamp(0.0, 1.0)
+                strength = float(quality_strength)
+                reliability = known_clear * (
+                    (1.0 - strength) + strength * quality_output['reliability']
+                )
+                estimated_dirty = (1.0 - reliability).detach()
+                quality_mask = torch.maximum(quality_input_mask, estimated_dirty)
+                x = x * quality_mask + (1.0 - quality_mask) * quality_target
+                cloud_mask = quality_mask
         elif quality_only:
             raise ValueError("quality_only=True requires target quality refinement and quality_target.")
 
@@ -1161,6 +1183,8 @@ class SDT(nn.Module):
         )
         if return_aux:
             output = {"prediction": x}
+            if quality_output is not None:
+                output["quality_output"] = quality_output
             if landcover_output is not None:
                 output.update(landcover_output)
             return output

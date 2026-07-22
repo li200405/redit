@@ -1,6 +1,8 @@
 import logging
 import time
+from contextlib import nullcontext
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from typing import Any, Dict, Optional, Tuple
 from torch import Tensor
@@ -11,6 +13,7 @@ from prodict import Prodict
 import torch.nn.functional as F
 
 from torch.utils.tensorboard import SummaryWriter
+from torch.nn.parallel import DistributedDataParallel
 from lib import logger, visutils
 from lib.logger import AverageMeter
 import wandb
@@ -69,8 +72,28 @@ class Trainer:
             scheduler
     ):
         self.args = args
-        self.use_wandb = bool('wandb' in args)
-        self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.distributed = dist.is_available() and dist.is_initialized()
+        self.rank = dist.get_rank() if self.distributed else 0
+        self.world_size = dist.get_world_size() if self.distributed else 1
+        self.is_main_process = self.rank == 0
+        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        self.device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
+        self.use_wandb = bool('wandb' in args) and self.is_main_process
+        self.amp_enabled = torch.cuda.is_available()
+        supports_bf16 = (
+            self.amp_enabled
+            and hasattr(torch.cuda, 'is_bf16_supported')
+            and torch.cuda.is_bf16_supported()
+        )
+        self.amp_dtype = (
+            torch.bfloat16 if supports_bf16
+            else torch.float16
+        )
+        scaler_enabled = self.amp_enabled and self.amp_dtype == torch.float16
+        if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+            self.grad_scaler = torch.amp.GradScaler('cuda', enabled=scaler_enabled)
+        else:
+            self.grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
         self.CTHW = self.args.data.ifCTHW
 
@@ -97,12 +120,17 @@ class Trainer:
         self.best_loss = np.inf
         self.epoch_best_loss = np.nan
 
-        os.makedirs(self.args.save_dir, exist_ok=True)
-        os.makedirs(self.args.checkpoint_dir, exist_ok=True)
+        if self.is_main_process:
+            os.makedirs(self.args.save_dir, exist_ok=True)
+            os.makedirs(self.args.checkpoint_dir, exist_ok=True)
         self.args.path_model_best = os.path.join(self.args.checkpoint_dir, 'Model_best.pth')
         self.args.path_model_last = os.path.join(self.args.checkpoint_dir, 'Model_last.pth')
-        self.logger = logger.prepare_logger('train_logger', level=logging.INFO, log_to_console=True,
-                                            log_file=os.path.join(args.save_dir, 'training.log'))
+        self.logger = logger.prepare_logger(
+            'train_logger',
+            level=logging.INFO,
+            log_to_console=self.is_main_process,
+            log_file=os.path.join(args.save_dir, 'training.log') if self.is_main_process else None,
+        )
 
         self.noise_scheduler = noise_scheduler
 
@@ -124,14 +152,25 @@ class Trainer:
             # wandb.define_metric('train/total_loss', summary=OBJECTIVE['total_loss'])
             # wandb.define_metric('val/total_loss', summary=OBJECTIVE['total_loss'])
         else:
-            os.makedirs(os.path.join(self.args.save_dir, 'tb'), exist_ok=True)
-            self.writer = SummaryWriter(log_dir=os.path.join(self.args.save_dir, 'tb'))
+            if self.is_main_process:
+                os.makedirs(os.path.join(self.args.save_dir, 'tb'), exist_ok=True)
+                self.writer = SummaryWriter(log_dir=os.path.join(self.args.save_dir, 'tb'))
+            else:
+                self.writer = None
+
+        if self.is_main_process:
+            precision_name = 'BF16' if self.amp_dtype == torch.bfloat16 else 'FP16'
+            self.logger.info(
+                'Automatic mixed precision: %s; VMamba scan checkpointing: enabled.',
+                precision_name if self.amp_enabled else 'disabled',
+            )
 
         # Resume training
         if self.args.resume and self.args.pretrained_path:
             self._resume(path=self.args.pretrained_path)
         else:
-            self.logger.info('\nTraining from scratch.\n')
+            if self.is_main_process:
+                self.logger.info('\nTraining from scratch.\n')
             self.epoch = 0
             self.iter = 0
 
@@ -157,8 +196,14 @@ class Trainer:
         if not os.path.isfile(path):
             raise FileNotFoundError(f'No checkpoint found at {path}\n')
 
-        checkpoint = torch.load(path)
-        self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        checkpoint = torch.load(path, map_location=self.device)
+        target_model = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
+        state_dict = checkpoint['model_state_dict']
+        if any(key.startswith('module.') for key in state_dict):
+            state_dict = {
+                key.removeprefix('module.'): value for key, value in state_dict.items()
+            }
+        target_model.load_state_dict(state_dict, strict=False)
         # self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         #
         # if self.args.get('load_scheduler_state_dict', True) and 'scheduler_state_dict' in checkpoint:
@@ -181,12 +226,16 @@ class Trainer:
         self.iter = 0
 
     def _log_iter_epoch(self) -> None:
+        if not self.is_main_process:
+            return
         if self.use_wandb:
             wandb.log({'epoch': self.epoch}, step=self.iter)
         else:
             self.writer.add_scalar('epoch', self.epoch, self.iter)
 
     def _log_learning_rate(self) -> None:
+        if not self.is_main_process:
+            return
         if self.use_wandb:
             wandb.log({'log_lr': np.log10(self._get_lr()), 'epoch': self.epoch}, step=self.iter)
         else:
@@ -221,10 +270,13 @@ class Trainer:
         return stats
 
     def _save_checkpoint(self, filepath: str) -> None:
+        if not self.is_main_process:
+            return
+        target_model = self.model.module if isinstance(self.model, DistributedDataParallel) else self.model
         state = {
             'epoch': self.epoch,
             'iter': self.iter,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': target_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_loss': self.best_loss,
             'best_epoch': self.epoch_best_loss
@@ -236,6 +288,8 @@ class Trainer:
         torch.save(state, filepath)
 
     def _log_stats_meter(self, phase: str) -> None:
+        if not self.is_main_process:
+            return
         if self.use_wandb:
             if phase == 'train':
                 wandb.log({
@@ -259,10 +313,11 @@ class Trainer:
         if self.use_wandb and self.args.get('log_gradients', False):
             wandb.watch(self.model, log='all')
 
-        self.logger.info('\nStart training...\n')
+        if self.is_main_process:
+            self.logger.info('\nStart training...\n')
         start_time = time.time()
 
-        with tqdm(range(self.epoch, self.args.num_epochs), leave=True) as tnr:
+        with tqdm(range(self.epoch, self.args.num_epochs), leave=True, disable=not self.is_main_process) as tnr:
             tnr.set_description("Epoch")
             tnr.set_postfix(epoch=self.epoch, training_loss=np.nan)
             for _ in tnr:
@@ -291,10 +346,11 @@ class Trainer:
                 self.epoch += 1
 
         time_elapsed = int(time.time() - start_time)
-        self.logger.info(
-            '\n\nTraining finished!\nTraining time: %dd %dh %dm %ds' % seconds_to_dd_hh_mm_ss(time_elapsed))
-        self.logger.info('\nBest model at epoch: %d', self.epoch_best_loss)
-        self.logger.info(f'Validation loss of the best model: {self.best_loss:.4f}')
+        if self.is_main_process:
+            self.logger.info(
+                '\n\nTraining finished!\nTraining time: %dd %dh %dm %ds' % seconds_to_dd_hh_mm_ss(time_elapsed))
+            self.logger.info('\nBest model at epoch: %d', self.epoch_best_loss)
+            self.logger.info(f'Validation loss of the best model: {self.best_loss:.4f}')
 
         # Save the last model
         self._save_checkpoint(self.args.path_model_last)
@@ -307,42 +363,73 @@ class Trainer:
         self.train_stats = self._stats_meter(stats_type='loss')
         # self.train_metrics = self._stats_meter(stats_type='metrics')
         self.model.train()
+        sampler = getattr(self.dataloader['train'], 'sampler', None)
+        if self.distributed and isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
+            sampler.set_epoch(self.epoch)
 
         # Clear gradients
-        for param in self.model.parameters():
-            param.grad = None
+        self.optimizer.zero_grad(set_to_none=True)
+        epoch_loss_sums = None
+        local_batch_count = 0
+        logstep_train = max(int(self.args.misc.get('logstep_train', 20)), 1)
 
-        with tqdm(self.dataloader['train'], leave=False) as tnr_train:
+        with tqdm(self.dataloader['train'], leave=False, disable=not self.is_main_process) as tnr_train:
             tnr_train.set_description("Training")
             tnr_train.set_postfix(epoch=self.epoch, training_loss=np.nan, best_loss=self.best_loss)
 
             for i, batch in enumerate(tnr_train):
-                self._log_iter_epoch()
+                if i % logstep_train == 0:
+                    self._log_iter_epoch()
                 loss, loss_dict = self.inference_one_batch(batch)
-
-                # Update to stats_meter
-                for key, value in loss_dict.items():
-                    self.train_stats[key].update(value)
+                if epoch_loss_sums is None:
+                    epoch_loss_sums = {
+                        key: value.detach().clone() for key, value in loss_dict.items()
+                    }
+                else:
+                    for key, value in loss_dict.items():
+                        epoch_loss_sums[key].add_(value.detach())
+                local_batch_count += 1
 
                 loss = loss / self.args.accum_iter
-                loss.backward()
+                if self.grad_scaler.is_enabled():
+                    self.grad_scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 # gradient accumulation
                 if ((i + 1) % self.args.accum_iter == 0) or (i + 1 == len(self.dataloader['train'])):
                     # Gradient clipping
+                    if self.grad_scaler.is_enabled():
+                        self.grad_scaler.unscale_(self.optimizer)
                     if getattr(self.args, 'gradient_clip_norm', False) and self.args.gradient_clip_norm > 0.:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.gradient_clip_norm)
 
                     elif getattr(self.args, 'gradient_clip_value', False) and self.args.gradient_clip_value > 0.:
                         torch.nn.utils.clip_grad_value_(self.model.parameters(), self.args.gradient_clip_value)
 
-                    self.optimizer.step()
+                    if self.grad_scaler.is_enabled():
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                    else:
+                        self.optimizer.step()
 
                     # Clear gradients
-                    for param in self.model.parameters():
-                        param.grad = None
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 self.iter += 1
+
+            if epoch_loss_sums is None:
+                raise RuntimeError('Training dataloader produced no batches.')
+
+            loss_keys = tuple(epoch_loss_sums.keys())
+            loss_values = torch.stack([epoch_loss_sums[key] for key in loss_keys])
+            batch_count = loss_values.new_tensor(float(local_batch_count))
+            if self.distributed:
+                dist.all_reduce(loss_values, op=dist.ReduceOp.SUM)
+                dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
+            loss_values = loss_values / batch_count.clamp_min(1.0)
+            for key, value in zip(loss_keys, loss_values.cpu().tolist()):
+                self.train_stats[key].update(value)
 
             tnr_train.set_postfix(
                 epoch=self.epoch,
@@ -357,10 +444,11 @@ class Trainer:
                 )
 
 
-            self.logger.info((f'Train:\tEpoch: {self.epoch}\t' + f'learning rate: {self._get_lr():.8f}\t'
-                              ''.join([f'{k}: {v.avg:.6f}\t' for k, v in self.train_stats.items()])))
+            if self.is_main_process:
+                self.logger.info((f'Train:\tEpoch: {self.epoch}\t' + f'learning rate: {self._get_lr():.8f}\t'
+                                  ''.join([f'{k}: {v.avg:.6f}\t' for k, v in self.train_stats.items()])))
 
-            if self.best_loss > self.train_stats.total_loss.avg:
+            if self.is_main_process and self.best_loss > self.train_stats.total_loss.avg:
                 self.best_loss = self.train_stats.total_loss.avg
                 self.epoch_best_loss = self.epoch
                 self._save_checkpoint(self.args.path_model_best)
@@ -368,6 +456,19 @@ class Trainer:
             # Reset stats and metrics
             for key in self.train_stats:
                 self.train_stats[key].reset()
+
+    def _reduce_loss_dict(self, loss_dict: Dict[str, float]) -> Dict[str, float]:
+        if not self.distributed:
+            return loss_dict
+        keys = tuple(loss_dict.keys())
+        values = torch.tensor([loss_dict[key] for key in keys], device=self.device)
+        dist.all_reduce(values, op=dist.ReduceOp.AVG)
+        return {key: value.item() for key, value in zip(keys, values)}
+
+    def _autocast_context(self):
+        if not self.amp_enabled:
+            return nullcontext()
+        return torch.autocast(device_type='cuda', dtype=self.amp_dtype)
 
 
 
@@ -488,27 +589,25 @@ class Trainer:
             self, batch: Dict[str, Any]
     ) -> Tuple[Tensor, Dict[str, float]]:
 
-        y_0 = batch['y'].cuda()                #  (B, T, C, H, W)
-        mask = batch['masks'].cuda()           #  (B, T, 1, H, W)
+        y_0 = batch['y'].to(self.device, non_blocking=True)                #  (B, T, C, H, W)
+        mask = batch['masks'].to(self.device, non_blocking=True)           #  (B, T, 1, H, W)
         cloud_mask = batch.get('cloud_mask')
-        cloud_mask = cloud_mask.cuda() if cloud_mask is not None else torch.zeros_like(mask)
-        date = batch['position_days'].cuda()            #  (B, T)           'position_days' or None
+        cloud_mask = cloud_mask.to(self.device, non_blocking=True) if cloud_mask is not None else torch.zeros_like(mask)
+        date = batch['position_days'].to(self.device, non_blocking=True)   #  (B, T)           'position_days' or None
         # date = None
-        cond = batch['cond'].cuda()            #  (B, T, 3, H, W)
+        cond = batch['cond'].to(self.device, non_blocking=True)            #  (B, T, 3, H, W)
         cond_dense = batch.get('cond_dense')
-        cond_dense = cond_dense.cuda() if cond_dense is not None else None
+        cond_dense = cond_dense.to(self.device, non_blocking=True) if cond_dense is not None else None
         date_cond_dense = batch.get('position_days_cond_dense')
-        date_cond_dense = date_cond_dense.cuda() if date_cond_dense is not None else None
+        date_cond_dense = date_cond_dense.to(self.device, non_blocking=True) if date_cond_dense is not None else None
         date_dense_target = batch.get('position_days_s2_raw')
-        date_dense_target = date_dense_target.cuda() if date_dense_target is not None else date
+        date_dense_target = date_dense_target.to(self.device, non_blocking=True) if date_dense_target is not None else date
         bs, length = y_0.shape[0], y_0.shape[1]
 
         if self.CTHW:
             y_0 = y_0.permute(0, 2, 1, 3, 4)     #  (B, C, T, H, W)
             mask = mask.permute(0, 2, 1, 3, 4)   #  (B, 1, T, H, W)
             cloud_mask = cloud_mask.permute(0, 2, 1, 3, 4)
-
-        # with torch.cuda.amp.autocast(enabled=self.args.use_amp):  # casts operations to mixed precision
 
         noise = torch.randn(y_0.shape).to(y_0.device)
         timesteps = torch.randint(0, self.noise_scheduler.num_train_timesteps, (bs,), device=y_0.device).long()
@@ -519,63 +618,61 @@ class Trainer:
 
         quality_enabled = self.target_quality_args.get('enabled', True)
         if quality_enabled:
-            quality_output = self.model(
-                y_0,
+            warmup_epochs = max(
+                int(self.target_quality_args.get('warmup_epochs', 100)), 1
+            )
+            quality_strength = min(float(self.epoch + 1) / warmup_epochs, 1.0)
+            model_input = noisy_images
+            model_cloud_mask = cloud_mask
+        else:
+            quality_strength = 0.0
+            quality_mask = torch.maximum(mask, cloud_mask)
+            model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
+            model_cloud_mask = quality_mask
+
+        landcover_loss_enabled = bool(
+            self.landcover_loss_args.get('enabled', False)
+        )
+        with self._autocast_context():
+            model_output = self.model(
+                model_input,
                 timesteps,
                 date=date,
                 cond=cond,
                 cond_dense=cond_dense,
                 date_cond_dense=date_cond_dense,
                 date_dense_target=date_dense_target,
-                cloud_mask=cloud_mask,
-                quality_target=y_0,
-                quality_only=True,
+                cloud_mask=model_cloud_mask,
+                quality_target=y_0 if quality_enabled else None,
+                quality_input_mask=mask if quality_enabled else None,
+                quality_strength=quality_strength,
+                landcover_source=y_0,
+                return_aux=landcover_loss_enabled or quality_enabled,
             )
-
-            warmup_epochs = max(
-                int(self.target_quality_args.get('warmup_epochs', 100)), 1
-            )
-            quality_strength = min(float(self.epoch + 1) / warmup_epochs, 1.0)
-            known_clear = 1.0 - cloud_mask
-            learned_reliability = quality_output['reliability']
-            reliability = known_clear * (
-                (1.0 - quality_strength) + quality_strength * learned_reliability
-            )
-
-            # The estimated dirty probability is detached in the input path to
-            # prevent the reliability branch from hiding difficult pixels.
-            estimated_dirty = (1.0 - reliability).detach()
-            quality_mask = torch.maximum(mask, estimated_dirty)
-        else:
-            quality_output = None
-            reliability = 1.0 - cloud_mask
-            quality_mask = torch.maximum(mask, cloud_mask)
-
-        model_input = noisy_images * quality_mask + (1. - quality_mask) * y_0
-        landcover_loss_enabled = bool(
-            self.landcover_loss_args.get('enabled', False)
-        )
-        model_output = self.model(
-            model_input,
-            timesteps,
-            date=date,
-            cond=cond,
-            cond_dense=cond_dense,
-            date_cond_dense=date_cond_dense,
-            date_dense_target=date_dense_target,
-            cloud_mask=quality_mask,
-            landcover_source=y_0,
-            return_aux=landcover_loss_enabled,
-        )
         if isinstance(model_output, dict):
-            pred_hat = model_output['prediction']
+            pred_hat = model_output['prediction'].float()
             building_prob = model_output.get('building_prob')
+            building_prob = building_prob.float() if building_prob is not None else None
+            quality_output = model_output.get('quality_output')
+            if quality_output is not None:
+                quality_output = {
+                    key: value.float() if isinstance(value, Tensor) else value
+                    for key, value in quality_output.items()
+                }
         else:
-            pred_hat = model_output
+            pred_hat = model_output.float()
             building_prob = None
+            quality_output = None
         # noise_hat = self.model(noisy_images * mask + (1. - mask) * y_0, timesteps, batch_positions=batch['position_days'])
 
-        if quality_output is not None:
+        if quality_enabled:
+            if quality_output is None:
+                raise RuntimeError('Quality-enabled training requires SDT quality_output.')
+            known_clear = 1.0 - cloud_mask
+            reliability = known_clear * (
+                (1.0 - quality_strength)
+                + quality_strength * quality_output['reliability']
+            )
             consensus = quality_output['consensus'].detach()
             support = quality_output['support'].detach()
             corrected_target = reliability * y_0 + (1.0 - reliability) * consensus
@@ -610,18 +707,38 @@ class Trainer:
             edge_target = y_0
 
         building_edge_loss = pred_hat.new_tensor(0.0)
-        if landcover_loss_enabled and building_prob is not None:
-            edge_loss = self._building_edge_loss(
-                pred_hat, edge_target, building_prob, loss_weight
-            )
-            edge_loss_w = float(
-                self.landcover_loss_args.get('building_edge_loss_w', 0.05)
-            )
-            building_edge_loss = edge_loss_w * edge_loss
+        spatial_gradient_weight = float(
+            self.restoration_loss_args.get('spatial_gradient_loss_w', 0.0)
+        )
+        need_edges = (
+            spatial_gradient_weight > 0.0
+            or (landcover_loss_enabled and building_prob is not None)
+        )
+        spatial_gradient_loss = pred_hat.new_tensor(0.0)
+        if need_edges:
+            prediction_edges = self._sobel_edges(self._rgb_like_channels(pred_hat))
+            target_edges = self._sobel_edges(self._rgb_like_channels(edge_target))
+            edge_error = (prediction_edges - target_edges).abs()
 
-        spatial_gradient_loss = self._spatial_gradient_loss(
-            pred_hat, edge_target, loss_weight
-        ) * float(self.restoration_loss_args.get('spatial_gradient_loss_w', 0.0))
+            if landcover_loss_enabled and building_prob is not None:
+                building_weight = (
+                    loss_weight * building_prob.detach()
+                ).expand_as(prediction_edges)
+                edge_loss = (
+                    (edge_error * building_weight).sum()
+                    / building_weight.sum().clamp_min(1.0)
+                )
+                edge_loss_w = float(
+                    self.landcover_loss_args.get('building_edge_loss_w', 0.05)
+                )
+                building_edge_loss = edge_loss_w * edge_loss
+
+            if spatial_gradient_weight > 0.0:
+                spatial_weight = loss_weight.expand_as(prediction_edges)
+                spatial_gradient_loss = (
+                    (edge_error * spatial_weight).sum()
+                    / spatial_weight.sum().clamp_min(1.0)
+                ) * spatial_gradient_weight
         spectral_angle_loss = self._spectral_angle_loss(
             pred_hat, edge_target, loss_weight
         ) * float(self.restoration_loss_args.get('spectral_angle_loss_w', 0.0))
@@ -638,12 +755,12 @@ class Trainer:
             + temporal_difference_loss
         )
         loss_dict = {
-            'reconstruction_loss': reconstruction_loss.detach().item(),
-            'reliability_loss': reliability_loss.detach().item(),
-            'building_edge_loss': building_edge_loss.detach().item(),
-            'spatial_gradient_loss': spatial_gradient_loss.detach().item(),
-            'spectral_angle_loss': spectral_angle_loss.detach().item(),
-            'temporal_difference_loss': temporal_difference_loss.detach().item(),
-            'total_loss': loss.detach().item(),
+            'reconstruction_loss': reconstruction_loss.detach(),
+            'reliability_loss': reliability_loss.detach(),
+            'building_edge_loss': building_edge_loss.detach(),
+            'spatial_gradient_loss': spatial_gradient_loss.detach(),
+            'spectral_angle_loss': spectral_angle_loss.detach(),
+            'temporal_difference_loss': temporal_difference_loss.detach(),
+            'total_loss': loss.detach(),
         }
         return loss, loss_dict

@@ -142,10 +142,25 @@ def get_optimizer(config: DictConfig, model, logger: Optional[logging.Logger] = 
 
     if config.optimizer.name == 'Adam':
         betas = config.optimizer.get('betas', (0.9, 0.999))
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=config.optimizer.learning_rate, weight_decay=config.optimizer.weight_decay,
-            betas=betas
-        )
+        optimizer_kwargs = {
+            'lr': config.optimizer.learning_rate,
+            'weight_decay': config.optimizer.weight_decay,
+            'betas': betas,
+        }
+        use_fused = bool(config.optimizer.get('fused', torch.cuda.is_available()))
+        if use_fused and torch.cuda.is_available():
+            try:
+                optimizer = torch.optim.Adam(
+                    model.parameters(), fused=True, **optimizer_kwargs
+                )
+                if logger is not None:
+                    logger.info('Optimizer: fused Adam CUDA kernel enabled.')
+            except (RuntimeError, TypeError) as error:
+                if logger is not None:
+                    logger.warning('Fused Adam is unavailable (%s); using standard Adam.', error)
+                optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), **optimizer_kwargs)
     elif config.optimizer.name == 'SGD':
         optimizer = torch.optim.SGD(
             model.parameters(), lr=config.optimizer.learning_rate,  weight_decay=config.optimizer.weight_decay,

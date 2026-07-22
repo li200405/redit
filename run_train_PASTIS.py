@@ -7,11 +7,14 @@ from argparse import ArgumentParser
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from omegaconf import OmegaConf
 
 from lib import config_utils, data_utils, utils
 from lib.formatter import RawFormatter
 from lib.logger import prepare_logger
+from lib.models.vmamba_blocks import selective_scan_backend_name
 from diffusers.schedulers import DDIMScheduler
 
 parser = ArgumentParser(
@@ -28,9 +31,32 @@ parser.add_argument('--wandb', action='store_true', default=False, help='Use Wei
 parser.add_argument('--wandb_project', type=str, default='utilise', help='Wandb project name')
 
 
+def setup_distributed() -> tuple[bool, int, int]:
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    if world_size <= 1:
+        return False, 0, 1
+    if not torch.cuda.is_available():
+        raise RuntimeError('DDP requires CUDA/NCCL for this training entry point.')
+
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')
+    return True, dist.get_rank(), world_size
+
+
 def main(args: argparse.Namespace) -> None:
+    distributed, rank, world_size = setup_distributed()
+    is_main_process = rank == 0
+    if torch.cuda.is_available():
+        # Input resolution is fixed during Chongqing training, so convolution
+        # autotuning and TF32 can safely improve throughput on Ampere+ cards.
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision('high')
     prog_name = 'RESTORE-DiT: Reliable satellite image time series reconstruction by multimodal sequential diffusion transformer (Training)'
-    print('\n{}\n{}\n'.format(prog_name, '=' * len(prog_name)))
+    if is_main_process:
+        print('\n{}\n{}\n'.format(prog_name, '=' * len(prog_name)))
 
     if not os.path.exists(args.config_file):
         raise FileNotFoundError(f'ERROR: Cannot find the yaml configuration file: {args.config_file}')
@@ -50,47 +76,74 @@ def main(args: argparse.Namespace) -> None:
         config.wandb = OmegaConf.create()
         config.wandb.project = args.wandb_project
 
-    # Create the output directory. The name of the output directory is a combination of the current date, time, and an
-    # optional suffix.
-    config.output.experiment_folder = utils.create_output_directory(config)
+    # Only rank 0 creates the experiment directory, then shares it with every
+    # DDP worker so logs and checkpoints have one consistent location.
+    if is_main_process:
+        config.output.experiment_folder = utils.create_output_directory(config)
+    if distributed:
+        experiment_folder = [config.output.experiment_folder if is_main_process else None]
+        dist.broadcast_object_list(experiment_folder, src=0)
+        config.output.experiment_folder = experiment_folder[0]
+        dist.barrier()
 
     # Set up the logger
     log_file = os.path.join(config.output.experiment_folder, 'run.log') if config.output.experiment_folder else None
-    logger = prepare_logger('root_logger', level=logging.INFO, log_to_console=True, log_file=log_file)
+    logger = prepare_logger(
+        'root_logger',
+        level=logging.INFO,
+        log_to_console=is_main_process,
+        log_file=log_file if is_main_process else None,
+    )
 
     # Print runtime arguments to the console
-    logger.info('Configuration file: %s', args.config_file)
-    logger.info('\nSettings\n--------\n')
-    config_utils.print_config(config, logger=logger)
+    if is_main_process:
+        logger.info('Configuration file: %s', args.config_file)
+        logger.info('\nSettings\n--------\n')
+        config_utils.print_config(config, logger=logger)
+        if distributed:
+            logger.info(
+                'DDP enabled: %d GPUs, per-GPU batch=%d, effective global batch=%d',
+                world_size,
+                config.training_settings.batch_size,
+                config.training_settings.batch_size * world_size,
+            )
 
     if config.misc.random_seed is not None:
         utils.set_seed(config.misc.random_seed)
 
     # ------------------------------------------------- Data loaders ------------------------------------------------- #
-    logger.info('\nInitialize data loader (training set)...')
+    if is_main_process:
+        logger.info('\nInitialize data loader (training set)...')
     train_loader = data_utils.get_dataloader(
         config, phase='train', pin_memory=config.misc.pin_memory, drop_last=True, logger=logger
     )
-    logger.info('Initialize data loader (validation set)...\n')
+    if is_main_process:
+        logger.info('Initialize data loader (validation set)...\n')
     val_loader = None
 
-    logger.info('Number of training samples: %d', train_loader.dataset.__len__())
+    if is_main_process:
+        logger.info('Number of training samples: %d', train_loader.dataset.__len__())
 
     # ----------------------------------------- Prepare the output directory ----------------------------------------- #
     logger.info('\nPrepare output folders and files\n--------------------------------\n')
 
     # Save the path of the checkpoint directory
     config.output.checkpoint_dir = os.path.join(config.output.experiment_folder, 'checkpoints')
-    os.makedirs(config.output.checkpoint_dir, exist_ok=True)
-    logger.info('Model weights will be stored in: %s\n', config.output.checkpoint_dir)
+    if is_main_process:
+        os.makedirs(config.output.checkpoint_dir, exist_ok=True)
+        logger.info('Model weights will be stored in: %s\n', config.output.checkpoint_dir)
+    if distributed:
+        dist.barrier()
 
     # Write the runtime configuration to file
-    config_file = os.path.join(config.output.experiment_folder, 'config.yaml')
-    config_utils.write_config(config, config_file)
+    if is_main_process:
+        config_file = os.path.join(config.output.experiment_folder, 'config.yaml')
+        config_utils.write_config(config, config_file)
 
     # ----------------------------------------------- Define the model ----------------------------------------------- #
-    logger.info('\nModel Architecture\n------------------\n')
-    logger.info('Architecture: %s', config.method.model_type)
+    if is_main_process:
+        logger.info('\nModel Architecture\n------------------\n')
+        logger.info('Architecture: %s', config.method.model_type)
 
 
     # input_dim = train_loader.dataset.num_channels
@@ -98,14 +151,17 @@ def main(args: argparse.Namespace) -> None:
 
     model, args_model = utils.get_model(config, input_dim, logger)
 
-    logger.info('Number of trainable parameters: %d\n', utils.count_model_parameters(model))
+    if is_main_process:
+        logger.info('Number of trainable parameters: %d\n', utils.count_model_parameters(model))
+        logger.info('VMamba selective-scan backend: %s\n', selective_scan_backend_name())
 
     # Log model parameters to file
-    config_file = os.path.join(config.output.experiment_folder, 'model_config.yaml')
-    config_utils.write_config(OmegaConf.create({config.method.model_type: args_model}), config_file)
+    if is_main_process:
+        config_file = os.path.join(config.output.experiment_folder, 'model_config.yaml')
+        config_utils.write_config(OmegaConf.create({config.method.model_type: args_model}), config_file)
 
     # Write model architecture to txt file
-    if config.output.plot_model_txt:
+    if is_main_process and config.output.plot_model_txt:
         file = os.path.join(config.output.experiment_folder, 'model_parameters.txt')
         logger.info('Writing model architecture to file: %s\n', file)
         utils.write_model_structure_to_file(
@@ -113,12 +169,22 @@ def main(args: argparse.Namespace) -> None:
             train_loader.dataset.image_size
         )
 
-    model = nn.DataParallel(model)
+    if torch.cuda.is_available():
+        device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', '0')))
+        model = model.to(device)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[int(os.environ['LOCAL_RANK'])],
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
     # --------------------------------------------------- Training --------------------------------------------------- #
-    logger.info('\nPrepare training\n----------------\n')
-    logger.info('Python version: %s', sys.version)
-    logger.info('Torch version: %s', torch.__version__)
-    logger.info('CUDA version: %s\n', torch.version.cuda)
+    if is_main_process:
+        logger.info('\nPrepare training\n----------------\n')
+        logger.info('Python version: %s', sys.version)
+        logger.info('Torch version: %s', torch.__version__)
+        logger.info('CUDA version: %s\n', torch.version.cuda)
 
     # Get optimizer and learning rate scheduler
     optimizer = utils.get_optimizer(config, model, logger)
@@ -131,7 +197,11 @@ def main(args: argparse.Namespace) -> None:
 
     # Initialize the trainer and start training
     trainer = utils.get_trainer(config, train_loader, val_loader, model, noise_scheduler, optimizer, scheduler)
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == '__main__':

@@ -25,7 +25,7 @@ data:
 SDT:
     in_channels: 10
     input_size: 128
-    patch_size: 4
+    patch_size: 8
     num_frames: 13
     cond_in_channels: 2
     landcover_router_enabled: true
@@ -61,10 +61,18 @@ restoration_loss:
 
 training_settings:
     batch_size: 16
+    num_epochs: 2400
+    resume: true
+    pretrained_path: /home/user-ljx/data/RESTORE-DiT-main/results/2026-07-17_19-51/checkpoints/Model_after_600_epochs.pth
+
+optimizer:
+    fused: true
 
 misc:
     num_workers: 8
-    pin_memory: false
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
 
 output:
     plot_model_txt: false

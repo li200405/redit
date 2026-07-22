@@ -47,8 +47,17 @@ configs/config_chongqin_train.yaml
 Run on GPUs 6, 7, and 8:
 
 ```bash
-CUDA_VISIBLE_DEVICES=6,7,8 python run_train_PASTIS.py configs/config_chongqin_train.yaml --save_dir ./results/
+CUDA_VISIBLE_DEVICES=6,7,8 torchrun --standalone --nproc_per_node=3 run_train_PASTIS.py configs/config_chongqin_train.yaml --save_dir ./results/
 ```
+
+Multi-GPU training uses DDP. `training_settings.batch_size` is the batch on
+each GPU, so the current value `1` gives an effective global batch of `3` on
+three GPUs. This same configuration is safe for a single 24GB GPU and mixed
+GPU groups.
+
+Training automatically uses BF16 on supported GPUs and FP16 on older GPUs.
+VMamba scans recompute short segments during backward to reduce activation
+memory; this changes training speed, not the inference architecture.
 
 ## Reconstruct one NPY sample
 

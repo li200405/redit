@@ -7,9 +7,11 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.nn import functional as F
+from torch.utils.data.distributed import DistributedSampler
 
 from lib.datasets import DATASETS
 
@@ -130,7 +132,12 @@ def get_dataloader(
     """Returns a torch.utils.data.DataLoader instance."""
 
     dset = get_dataset(config, phase, logger)
-    variable_seq_length = getattr(dset, 'variable_seq_length', False) and config.training_settings.batch_size > 1
+    distributed = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if distributed else 1
+    local_batch_size = int(config.training_settings.batch_size)
+    if local_batch_size < 1:
+        raise ValueError('batch_size must be a positive integer.')
+    variable_seq_length = getattr(dset, 'variable_seq_length', False) and local_batch_size > 1
     shuffle = config['misc']['run_mode'] != 'test'
 
     if variable_seq_length:
@@ -138,9 +145,39 @@ def get_dataloader(
     else:
         collate_fn = None
 
-    loader = torch.utils.data.DataLoader(dataset=dset, batch_size=config.training_settings.batch_size, shuffle=shuffle,
-                                         num_workers=config.misc.num_workers, collate_fn=collate_fn,
-                                         pin_memory=pin_memory, drop_last=drop_last)
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
+            dset,
+            num_replicas=world_size,
+            rank=dist.get_rank(),
+            shuffle=shuffle,
+            drop_last=drop_last,
+        )
+        shuffle = False
+
+    num_workers = int(config.misc.num_workers)
+    loader_kwargs = {
+        'dataset': dset,
+        'batch_size': local_batch_size,
+        'shuffle': shuffle,
+        'sampler': sampler,
+        'num_workers': num_workers,
+        'collate_fn': collate_fn,
+        'pin_memory': pin_memory,
+        'drop_last': drop_last,
+    }
+    if num_workers > 0:
+        # Training creates a new iterator every epoch. Keeping workers alive
+        # avoids repeatedly reopening the large S1/S2 NPY files.
+        loader_kwargs['persistent_workers'] = bool(
+            config.misc.get('persistent_workers', True)
+        )
+        loader_kwargs['prefetch_factor'] = int(
+            config.misc.get('prefetch_factor', 2)
+        )
+
+    loader = torch.utils.data.DataLoader(**loader_kwargs)
 
     return loader
 

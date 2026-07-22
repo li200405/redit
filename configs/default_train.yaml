@@ -91,13 +91,14 @@ training_settings:
     gradient_clip_value: 0                 # If > 0, clips gradient at specified value.
     resume: False                          # True to resume training, False otherwise.
     save_image_epochs: 10
-    save_model_epochs: 30
+    save_model_epochs: 200                 # Kept in sync with the active checkpoint interval below.
     load_scheduler_state_dict: true          # True to load the scheduler state dictionary from the checkpoint, False otherwise.
 
 optimizer:
     name: Adam                             # Optimizer.
     learning_rate: 2.e-04                  # Initial learning rate.  2.e-04
     weight_decay: 0                        # Weight decay.
+    fused: true                            # Use PyTorch fused CUDA Adam when available.
     lr_warmup_steps: 500
 
 scheduler:
@@ -129,7 +130,7 @@ metrics:
 
 misc:
     logstep_train: 20                     # Training log interval in number of iterations.
-    checkpoint_every_n_epochs: 50           # Save checkpoint after every `checkpoint_every_n_epochs` training epochs.
+    checkpoint_every_n_epochs: 200          # Save checkpoint after every `checkpoint_every_n_epochs` training epochs.
     log_gradients: false                   # True to log gradients and model parameters using Weights & Biases.
     val_every_n_epochs: 1                  # Validation interval in epochs.
     plot_every_n_epochs: 15                # Plot interval in epochs.
@@ -137,6 +138,8 @@ misc:
     num_workers: 8                         # Number of dataloader worker processes. # default 8
     random_seed: 0                         # Random seed.
     pin_memory: true                      # Pin memory (dataloader settings).
+    persistent_workers: true              # Keep NPY-loading workers alive between epochs.
+    prefetch_factor: 2                    # Batches prepared per worker ahead of GPU consumption.
     run_mode: train                        # Run mode. ['train', 'val', 'test']
 
 output:

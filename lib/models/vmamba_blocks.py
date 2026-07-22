@@ -7,6 +7,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+
+try:
+    # This import is intentionally optional: development machines and older
+    # environments can still run the original PyTorch scan implementation.
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+except ImportError:
+    selective_scan_fn = None
+
+
+def selective_scan_backend_name() -> str:
+    """Return the scan backend selected by this Python environment."""
+    if selective_scan_fn is not None:
+        return "mamba_ssm selective_scan_cuda (fused CUDA)"
+    return "segmented PyTorch fallback"
 
 
 def _repeat_condition(value: Tensor, repeats: int) -> Tensor:
@@ -20,11 +35,12 @@ def _modulate(x: Tensor, shift: Tensor, scale: Tensor, num_frames: int) -> Tenso
 
 
 class SelectiveStateScan1D(nn.Module):
-    """Pure PyTorch selective state scan with a multi-state SSM.
+    """Bidirectional selective state scan with a CUDA fused fast path.
 
-    The recurrence is intentionally kept explicit. Spatial scans have length 32
-    for 128 px inputs with 4 px patches, while temporal scans have length 13,
-    so this implementation remains practical without a custom CUDA extension.
+    On CUDA, the optional ``mamba-ssm`` selective-scan kernel executes the full
+    recurrence in one fused operation. Environments without that extension keep
+    the previous segmented PyTorch recurrence so checkpoints and CPU inference
+    remain usable.
     """
 
     def __init__(
@@ -44,6 +60,67 @@ class SelectiveStateScan1D(nn.Module):
         self.skip = nn.Parameter(torch.ones(inner_dim))
         self.out_norm = nn.LayerNorm(inner_dim)
         self.out_proj = nn.Linear(inner_dim, dim)
+        # Recompute short scan segments during backward instead of retaining the
+        # state transition tensors for the full spatial row or column.
+        self.checkpoint_segment_length = 4
+
+    @property
+    def fused_cuda_available(self) -> bool:
+        """Whether this environment can use Mamba's fused selective scan."""
+        return selective_scan_fn is not None
+
+    def _fused_scan_direction(
+        self,
+        value: Tensor,
+        delta: Tensor,
+        gate: Tensor,
+        state_b: Tensor,
+        state_c: Tensor,
+        write_confidence: Optional[Tensor],
+        step_scale: Optional[Tensor],
+        reverse: bool,
+    ) -> Tensor:
+        """Run one scan direction through Mamba's CUDA selective-scan kernel."""
+        if reverse:
+            value = value.flip(1)
+            delta = delta.flip(1)
+            gate = gate.flip(1)
+            state_b = state_b.flip(1)
+            state_c = state_c.flip(1)
+            if write_confidence is not None:
+                write_confidence = write_confidence.flip(1)
+            if step_scale is not None:
+                step_scale = step_scale.flip(1)
+
+        rate = F.softplus(delta) + 1e-4
+        if step_scale is not None:
+            rate = rate * step_scale.to(rate.dtype)
+        if write_confidence is not None:
+            rate = rate * write_confidence.to(rate.dtype).clamp(0.0, 1.0)
+
+        # selective_scan_fn expects B/D/L. B and C are dynamically generated
+        # from each input token; D is the learned skip connection. The original
+        # scan used a manually expanded Euler update. This standard selective
+        # SSM parameterization is mathematically stable and maps directly to
+        # the fused CUDA implementation.
+        # The CUDA kernel requires u, delta, and variable B/C to share one
+        # scalar type. Date values and cloud confidences originate as fp32,
+        # so explicitly restore the autocast input precision here.
+        scan_dtype = value.dtype
+        output = selective_scan_fn(
+            value.transpose(1, 2).contiguous(),
+            rate.to(dtype=scan_dtype).transpose(1, 2).contiguous(),
+            -torch.exp(self.decay_log.float()),
+            torch.tanh(state_b).to(dtype=scan_dtype).transpose(1, 2).contiguous(),
+            torch.tanh(state_c).to(dtype=scan_dtype).transpose(1, 2).contiguous(),
+            D=self.skip.float(),
+            delta_softplus=False,
+        ).transpose(1, 2)
+        output = output / math.sqrt(self.state_dim)
+        output = output * torch.sigmoid(gate)
+        if reverse:
+            output = output.flip(1)
+        return output
 
     def _scan_direction(
         self,
@@ -81,26 +158,59 @@ class SelectiveStateScan1D(nn.Module):
             dtype=value.dtype,
         )
         continuous_a = -torch.exp(self.decay_log).to(value.dtype)
-        outputs = []
-        for index in range(value.shape[1]):
-            transition = torch.exp(
-                rate[:, index, :, None] * continuous_a[None]
-            ).clamp(1e-5, 1.0)
-            input_state = (
-                (1.0 - transition)
-                * value[:, index, :, None]
-                * torch.tanh(state_b[:, index, None, :])
-            )
-            state = transition * state + input_state
-            state_output = (
-                state * torch.tanh(state_c[:, index, None, :])
-            ).sum(dim=-1) / math.sqrt(self.state_dim)
-            output = (
-                state_output + self.skip * value[:, index]
-            ) * torch.sigmoid(gate[:, index])
-            outputs.append(output)
+        def scan_segment(
+            initial_state: Tensor,
+            value_segment: Tensor,
+            rate_segment: Tensor,
+            gate_segment: Tensor,
+            state_b_segment: Tensor,
+            state_c_segment: Tensor,
+        ) -> tuple[Tensor, Tensor]:
+            segment_state = initial_state
+            segment_outputs = []
+            for index in range(value_segment.shape[1]):
+                transition = torch.exp(
+                    rate_segment[:, index, :, None] * continuous_a[None]
+                ).clamp(1e-5, 1.0)
+                input_state = (
+                    (1.0 - transition)
+                    * value_segment[:, index, :, None]
+                    * torch.tanh(state_b_segment[:, index, None, :])
+                )
+                segment_state = transition * segment_state + input_state
+                state_output = (
+                    segment_state * torch.tanh(state_c_segment[:, index, None, :])
+                ).sum(dim=-1) / math.sqrt(self.state_dim)
+                output = (
+                    state_output + self.skip * value_segment[:, index]
+                ) * torch.sigmoid(gate_segment[:, index])
+                segment_outputs.append(output)
+            return segment_state, torch.stack(segment_outputs, dim=1)
 
-        scanned = torch.stack(outputs, dim=1)
+        use_checkpoint = self.training and torch.is_grad_enabled()
+        outputs = []
+        for start in range(0, value.shape[1], self.checkpoint_segment_length):
+            end = min(start + self.checkpoint_segment_length, value.shape[1])
+            segment_args = (
+                state,
+                value[:, start:end],
+                rate[:, start:end],
+                gate[:, start:end],
+                state_b[:, start:end],
+                state_c[:, start:end],
+            )
+            if use_checkpoint:
+                state, segment_output = checkpoint(
+                    scan_segment,
+                    *segment_args,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                state, segment_output = scan_segment(*segment_args)
+            outputs.append(segment_output)
+
+        scanned = torch.cat(outputs, dim=1)
         if reverse:
             scanned = scanned.flip(1)
         return scanned
@@ -113,11 +223,16 @@ class SelectiveStateScan1D(nn.Module):
     ) -> Tensor:
         value, delta, gate = self.in_proj(x).chunk(3, dim=-1)
         state_b, state_c = self.state_proj(x).chunk(2, dim=-1)
-        forward = self._scan_direction(
+        scan_direction = (
+            self._fused_scan_direction
+            if self.fused_cuda_available and value.is_cuda
+            else self._scan_direction
+        )
+        forward = scan_direction(
             value, delta, gate, state_b, state_c,
             write_confidence, step_scale, reverse=False
         )
-        backward = self._scan_direction(
+        backward = scan_direction(
             value, delta, gate, state_b, state_c,
             write_confidence, step_scale, reverse=True
         )

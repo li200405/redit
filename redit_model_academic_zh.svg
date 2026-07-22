@@ -1,0 +1,226 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1180" viewBox="0 0 2400 1180">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f7f9fc"/>
+    </linearGradient>
+    <linearGradient id="mainGrad" x1="0" x2="1">
+      <stop offset="0" stop-color="#eaf2ff"/>
+      <stop offset="1" stop-color="#d9e8fb"/>
+    </linearGradient>
+    <linearGradient id="outGrad" x1="0" x2="1">
+      <stop offset="0" stop-color="#e8faf7"/>
+      <stop offset="1" stop-color="#d6f1ec"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#27364a" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#34465d"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#3677b8"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#33866d"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#7556a8"/>
+    </marker>
+    <style>
+      text { font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif; fill:#203047; }
+      .title { font-size:38px; font-weight:700; letter-spacing:1px; }
+      .panel { font-size:24px; font-weight:700; }
+      .block { font-size:22px; font-weight:700; }
+      .label { font-size:18px; font-weight:600; }
+      .small { font-size:16px; fill:#516174; }
+      .tiny { font-size:14px; fill:#64748b; }
+      .box { stroke-width:2.2; }
+      .flow { fill:none; stroke:#34465d; stroke-width:3.2; marker-end:url(#arrow); }
+      .blue-flow { fill:none; stroke:#3677b8; stroke-width:3.2; marker-end:url(#arrowBlue); }
+      .green-flow { fill:none; stroke:#33866d; stroke-width:3.2; marker-end:url(#arrowGreen); }
+      .purple-flow { fill:none; stroke:#7556a8; stroke-width:3; marker-end:url(#arrowPurple); }
+      .thin { stroke-width:2.2; }
+      .dash { stroke-dasharray:8 7; }
+    </style>
+  </defs>
+
+  <rect width="2400" height="1180" fill="url(#bg)"/>
+  <text x="1200" y="70" text-anchor="middle" class="title">REDiT：SAR 引导的时空 VMamba 扩散重建网络</text>
+
+  <!-- Panel A -->
+  <rect x="55" y="108" width="2290" height="500" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="85" y="150" class="panel">(a) 整体架构</text>
+
+  <!-- Inputs -->
+  <text x="170" y="205" text-anchor="middle" class="label">多模态输入</text>
+  <g filter="url(#shadow)">
+    <rect x="90" y="230" width="170" height="92" rx="12" fill="#e8f2ff" stroke="#6d9fd1" class="box"/>
+    <rect x="103" y="247" width="56" height="56" rx="5" fill="#3779bb"/>
+    <path d="M109 291 L124 272 L137 283 L153 259" stroke="#fff" stroke-width="4" fill="none"/>
+    <circle cx="146" cy="255" r="6" fill="#f8d48b"/>
+    <text x="180" y="266" class="label">含云 S2</text>
+    <text x="180" y="292" class="small">光学时序</text>
+
+    <rect x="90" y="340" width="170" height="92" rx="12" fill="#e8f7ef" stroke="#63a98d" class="box"/>
+    <rect x="103" y="357" width="56" height="56" rx="5" fill="#33866d"/>
+    <path d="M109 394 C119 370 134 370 153 394 M109 377 C121 402 137 402 153 377" stroke="#fff" stroke-width="3.5" fill="none"/>
+    <text x="180" y="376" class="label">S1 SAR</text>
+    <text x="180" y="402" class="small">对齐与稠密时序</text>
+
+    <rect x="90" y="450" width="170" height="92" rx="12" fill="#f4effb" stroke="#9a7bc2" class="box"/>
+    <circle cx="131" cy="496" r="25" fill="#7556a8"/>
+    <path d="M131 477 V497 L146 505" stroke="#fff" stroke-width="4" fill="none" stroke-linecap="round"/>
+    <text x="180" y="486" class="label">条件信息</text>
+    <text x="180" y="512" class="small">日期 · 云掩膜 · 扩散步</text>
+  </g>
+
+  <!-- Embedding -->
+  <g filter="url(#shadow)">
+    <rect x="350" y="250" width="260" height="250" rx="18" fill="#f7f9fc" stroke="#9aa9ba" class="box"/>
+    <text x="480" y="292" text-anchor="middle" class="block">多模态特征编码</text>
+    <rect x="385" y="325" width="190" height="46" rx="9" fill="#dcecff"/>
+    <text x="480" y="355" text-anchor="middle" class="label">图像分块编码</text>
+    <rect x="385" y="387" width="190" height="46" rx="9" fill="#eee7f8"/>
+    <text x="480" y="417" text-anchor="middle" class="label">日期与掩膜编码</text>
+    <rect x="385" y="449" width="190" height="34" rx="8" fill="#e4f4ed"/>
+    <text x="480" y="472" text-anchor="middle" class="small">稠密 SAR 日期聚合</text>
+  </g>
+
+  <path d="M260 276 H350" class="blue-flow"/>
+  <path d="M260 386 H315 V365 H350" class="green-flow"/>
+  <path d="M260 496 H315 V430 H350" class="purple-flow"/>
+
+  <!-- Backbone -->
+  <g filter="url(#shadow)">
+    <rect x="700" y="215" width="830" height="325" rx="22" fill="url(#mainGrad)" stroke="#678db8" stroke-width="2.6"/>
+    <text x="1115" y="258" text-anchor="middle" class="block">条件时空 VMamba 主干</text>
+    <text x="1450" y="258" text-anchor="middle" class="small">重复堆叠</text>
+
+    <rect x="745" y="305" width="210" height="155" rx="14" fill="#e6f5ed" stroke="#63a98d" class="box"/>
+    <text x="850" y="345" text-anchor="middle" class="label">S1–S2 跨模态融合</text>
+    <text x="850" y="378" text-anchor="middle" class="small">光学特征查询</text>
+    <text x="850" y="405" text-anchor="middle" class="small">SAR 结构引导</text>
+    <path d="M790 432 H910" stroke="#33866d" stroke-width="3" marker-end="url(#arrowGreen)"/>
+
+    <rect x="985" y="305" width="210" height="155" rx="14" fill="#eee8f8" stroke="#9273bd" class="box"/>
+    <text x="1090" y="345" text-anchor="middle" class="label">双向时间 Mamba</text>
+    <text x="1090" y="378" text-anchor="middle" class="small">前向 / 反向扫描</text>
+    <text x="1090" y="405" text-anchor="middle" class="small">日期间隔感知</text>
+    <path d="M1030 430 H1150 M1150 442 H1030" stroke="#7556a8" stroke-width="3" marker-end="url(#arrowPurple)"/>
+
+    <rect x="1225" y="305" width="210" height="155" rx="14" fill="#e7f7f8" stroke="#5ca7ad" class="box"/>
+    <text x="1330" y="345" text-anchor="middle" class="label">多尺度空间 VMamba</text>
+    <text x="1330" y="378" text-anchor="middle" class="small">水平 / 垂直扫描</text>
+    <text x="1330" y="405" text-anchor="middle" class="small">局部细节分支</text>
+    <path d="M1278 432 H1382 M1330 415 V449" stroke="#318c96" stroke-width="3"/>
+
+    <path d="M955 382 H985" class="flow thin"/>
+    <path d="M1195 382 H1225" class="flow thin"/>
+    <path d="M1435 382 H1473 V486 H758 V460" fill="none" stroke="#7d8da1" stroke-width="2.2" stroke-dasharray="8 6"/>
+    <text x="1115" y="515" text-anchor="middle" class="small">条件归一化 · 前馈网络 · 残差连接</text>
+  </g>
+  <path d="M610 375 H700" class="flow"/>
+
+  <!-- Reconstruction -->
+  <g filter="url(#shadow)">
+    <rect x="1620" y="250" width="260" height="250" rx="18" fill="#f7f9fc" stroke="#9aa9ba" class="box"/>
+    <text x="1750" y="292" text-anchor="middle" class="block">重建解码</text>
+    <rect x="1655" y="326" width="190" height="52" rx="9" fill="#e8eef6"/>
+    <text x="1750" y="359" text-anchor="middle" class="label">序列反分块</text>
+    <rect x="1655" y="397" width="190" height="68" rx="9" fill="#ffe9e7" stroke="#d9877f" stroke-width="1.5"/>
+    <text x="1750" y="426" text-anchor="middle" class="label">高频细节修复</text>
+    <text x="1750" y="451" text-anchor="middle" class="tiny">边缘与纹理残差</text>
+  </g>
+  <path d="M1530 375 H1620" class="flow"/>
+
+  <!-- Output -->
+  <g filter="url(#shadow)">
+    <rect x="1980" y="255" width="275" height="240" rx="20" fill="url(#outGrad)" stroke="#50a798" class="box"/>
+    <text x="2118" y="296" text-anchor="middle" class="block">无云 S2 时序</text>
+    <g transform="translate(2040 328)">
+      <rect x="34" y="-16" width="132" height="116" rx="8" fill="#b9ddd3" stroke="#4f9e91" stroke-width="2"/>
+      <rect x="17" y="-8" width="132" height="116" rx="8" fill="#d1ebe3" stroke="#4f9e91" stroke-width="2"/>
+      <rect x="0" y="0" width="132" height="116" rx="8" fill="#6ba88a" stroke="#357a69" stroke-width="2.5"/>
+      <path d="M8 91 C32 60 48 76 68 45 C86 20 102 42 124 20" fill="none" stroke="#ecf4d5" stroke-width="8"/>
+      <path d="M8 106 L42 72 L69 87 L92 52 L124 62" fill="none" stroke="#2d6f59" stroke-width="5"/>
+    </g>
+    <text x="2118" y="474" text-anchor="middle" class="small">云遮挡区域恢复</text>
+  </g>
+  <path d="M1880 375 H1980" class="flow"/>
+
+  <!-- Panel B -->
+  <rect x="55" y="640" width="1480" height="470" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="85" y="682" class="panel">(b) 条件时空 VMamba 块</text>
+
+  <rect x="105" y="790" width="170" height="88" rx="12" fill="#eaf2ff" stroke="#6d9fd1" class="box"/>
+  <text x="190" y="826" text-anchor="middle" class="label">输入特征</text>
+  <text x="190" y="852" text-anchor="middle" class="small">S2 tokens</text>
+
+  <rect x="345" y="760" width="250" height="148" rx="15" fill="#e6f5ed" stroke="#63a98d" class="box"/>
+  <text x="470" y="802" text-anchor="middle" class="block">跨模态融合</text>
+  <text x="470" y="836" text-anchor="middle" class="small">S2 查询 S1 结构</text>
+  <text x="470" y="867" text-anchor="middle" class="small">空间与时间对应</text>
+
+  <rect x="665" y="760" width="250" height="148" rx="15" fill="#eee8f8" stroke="#9273bd" class="box"/>
+  <text x="790" y="802" text-anchor="middle" class="block">时间状态扫描</text>
+  <text x="790" y="836" text-anchor="middle" class="small">双向 Mamba</text>
+  <text x="790" y="867" text-anchor="middle" class="small">日期与 SAR 变化调制</text>
+
+  <rect x="985" y="760" width="250" height="148" rx="15" fill="#e7f7f8" stroke="#5ca7ad" class="box"/>
+  <text x="1110" y="802" text-anchor="middle" class="block">空间状态扫描</text>
+  <text x="1110" y="836" text-anchor="middle" class="small">全尺度 + 粗尺度</text>
+  <text x="1110" y="867" text-anchor="middle" class="small">二维方向与局部纹理</text>
+
+  <rect x="1305" y="790" width="170" height="88" rx="12" fill="#f3f5f8" stroke="#99a7b8" class="box"/>
+  <text x="1390" y="826" text-anchor="middle" class="label">条件前馈</text>
+  <text x="1390" y="852" text-anchor="middle" class="small">AdaLN · MLP</text>
+
+  <path d="M275 834 H345 M595 834 H665 M915 834 H985 M1235 834 H1305" class="flow"/>
+  <path d="M190 790 V724 H1390 V790" fill="none" stroke="#7d8da1" stroke-width="2.5" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+  <text x="790" y="714" text-anchor="middle" class="small">残差主路径</text>
+
+  <rect x="375" y="970" width="210" height="66" rx="12" fill="#e8f7ef" stroke="#63a98d" stroke-width="1.8"/>
+  <text x="480" y="998" text-anchor="middle" class="label">S1 条件特征</text>
+  <text x="480" y="1022" text-anchor="middle" class="tiny">跨模态键值</text>
+  <rect x="675" y="970" width="230" height="66" rx="12" fill="#f4effb" stroke="#9a7bc2" stroke-width="1.8"/>
+  <text x="790" y="998" text-anchor="middle" class="label">日期 · 稠密 SAR</text>
+  <text x="790" y="1022" text-anchor="middle" class="tiny">状态更新调制</text>
+  <rect x="995" y="970" width="230" height="66" rx="12" fill="#fff3df" stroke="#d4a04c" stroke-width="1.8"/>
+  <text x="1110" y="998" text-anchor="middle" class="label">云可靠性 · 地物门控</text>
+  <text x="1110" y="1022" text-anchor="middle" class="tiny">控制分支贡献</text>
+  <path d="M480 970 V910" class="green-flow thin"/>
+  <path d="M790 970 V910" class="purple-flow thin"/>
+  <path d="M1110 970 V910" fill="none" stroke="#d1973e" stroke-width="2.2" marker-end="url(#arrow)"/>
+
+  <!-- Panel C -->
+  <rect x="1570" y="640" width="775" height="470" rx="22" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="1600" y="682" class="panel">(c) 时空选择性扫描</text>
+
+  <text x="1770" y="746" text-anchor="middle" class="label">时间双向扫描</text>
+  <g transform="translate(1625 785)">
+    <rect x="0" y="0" width="72" height="72" rx="8" fill="#e2ebf7" stroke="#7d98b9" stroke-width="2"/>
+    <rect x="92" y="0" width="72" height="72" rx="8" fill="#d5e4f5" stroke="#7d98b9" stroke-width="2"/>
+    <rect x="184" y="0" width="72" height="72" rx="8" fill="#c9dcf1" stroke="#7d98b9" stroke-width="2"/>
+    <rect x="276" y="0" width="72" height="72" rx="8" fill="#bdd4ed" stroke="#7d98b9" stroke-width="2"/>
+    <path d="M18 93 H330" class="purple-flow thin"/>
+    <path d="M330 112 H18" class="purple-flow thin"/>
+  </g>
+  <text x="1770" y="934" text-anchor="middle" class="tiny">沿真实日期传播互补信息</text>
+
+  <line x1="1970" y1="720" x2="1970" y2="1052" stroke="#d5dde7" stroke-width="2"/>
+  <text x="2160" y="746" text-anchor="middle" class="label">空间多尺度扫描</text>
+  <g transform="translate(2040 785)">
+    <rect x="0" y="0" width="230" height="150" rx="10" fill="#edf8f8" stroke="#5ca7ad" stroke-width="2"/>
+    <g stroke="#bfdadd" stroke-width="1">
+      <path d="M46 0 V150 M92 0 V150 M138 0 V150 M184 0 V150"/>
+      <path d="M0 30 H230 M0 60 H230 M0 90 H230 M0 120 H230"/>
+    </g>
+    <path d="M15 45 H213 M213 75 H15 M15 105 H213" stroke="#318c96" stroke-width="3" fill="none" marker-end="url(#arrow)"/>
+    <path d="M68 15 V135 M115 135 V15 M162 15 V135" stroke="#6d9fd1" stroke-width="3" fill="none" marker-end="url(#arrowBlue)"/>
+    <rect x="76" y="42" width="78" height="66" rx="8" fill="#ffffff" fill-opacity="0.72" stroke="#d1973e" stroke-width="2" stroke-dasharray="6 4"/>
+  </g>
+  <text x="2155" y="962" text-anchor="middle" class="tiny">全局方向依赖 + 局部纹理</text>
+
+  <text x="1200" y="1152" text-anchor="middle" class="tiny">实线表示主数据流；虚线表示残差或调制路径。</text>
+</svg>
